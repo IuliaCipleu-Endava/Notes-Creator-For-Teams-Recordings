@@ -1,0 +1,4 @@
+nu merge
+problem
+nu funcționează
+nu te lasă

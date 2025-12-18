@@ -1,0 +1,7 @@
+nltk
+transformers
+python-docx
+langdetect
+accelerate 
+sentencepiece
+dateparser
