@@ -1,16 +1,11 @@
-import sys
 import json
-
-from scipy import stats
 import nltk
 import docx
 import re
 from pathlib import Path
 from collections import Counter
-from langdetect import detect, DetectorFactory
+from langdetect import detect
 import dateparser
-from datetime import datetime
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from llama_cpp import Llama  # GGUF / llama.cpp backend
 from functools import lru_cache
@@ -85,7 +80,7 @@ def chunk_text_llm_safe(text, max_tokens=1400):
     """
     Split text into chunks guaranteed to fit the model's context window.
     """
-    sentences = nltk.cached_sent_tokenize(text)
+    sentences = cached_sent_tokenize(text)
     chunks = []
     current = ""
 
@@ -127,7 +122,7 @@ def clean_transcript(text: str) -> str:
 
 def categorize_sentences(text: str, language: str):
     todos, solved, suggestions, issues = [], [], [], []
-    sentences = nltk.cached_sent_tokenize(text)
+    sentences = cached_sent_tokenize(text)
 
     if language == "romanian":
         todo_words = TODO_RO
@@ -163,7 +158,7 @@ def extract_dates(text: str, language: str):
     Return list of (sentence, date_str) for important-ish dates found.
     """
     results = []
-    sentences = nltk.cached_sent_tokenize(text)
+    sentences = cached_sent_tokenize(text)
     lang_code = "ro" if language == "romanian" else "en"
 
     for s in sentences:
@@ -584,7 +579,7 @@ def process_meetings(input_folder: str, output_folder: str,
             summary_list = filter_items(summary_list)
             summary = merge_summaries(summary_list)
         else:
-            summary = summary_list.strip() or " ".join(nltk.cached_sent_tokenize(clean)[:5])
+            summary = summary_list.strip() or " ".join(cached_sent_tokenize(clean)[:5])
             if "meeting transcript" in summary.lower() or "meeting notes" in summary.lower():
                 summary = ""
         summary = clean_summary(summary)
@@ -887,7 +882,7 @@ SUGGESTION_PHRASES = [
 
 def heuristic_extract_items(text):
     todos, issues, suggestions = [], [], []
-    sentences = nltk.cached_sent_tokenize(text)
+    sentences = cached_sent_tokenize(text)
 
     for s in sentences:
         low = s.lower()
