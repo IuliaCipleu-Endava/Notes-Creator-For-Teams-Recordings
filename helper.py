@@ -1,5 +1,7 @@
 import sys
 import json
+
+from scipy import stats
 import nltk
 import docx
 import re
@@ -11,6 +13,13 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from llama_cpp import Llama  # GGUF / llama.cpp backend
+from functools import lru_cache
+
+@lru_cache(maxsize=10000)
+def cached_tokenize(text: str):
+    """Tokenize text with LLM tokenizer using caching."""
+    return tuple(llm.tokenize(text.encode("utf-8")))
+
 
 # -------------------------------------------------------------------
 # 1. MODEL LOADING (GGUF / llama.cpp)
@@ -67,17 +76,22 @@ def detect_language(text: str) -> str:
 def count_tokens(text):
     return len(llm.tokenize(text.encode("utf-8")))
 
+@lru_cache(maxsize=5000)
+def cached_sent_tokenize(text: str):
+    return tuple(nltk.sent_tokenize(text))
+
+
 def chunk_text_llm_safe(text, max_tokens=1400):
     """
     Split text into chunks guaranteed to fit the model's context window.
     """
-    sentences = nltk.sent_tokenize(text)
+    sentences = nltk.cached_sent_tokenize(text)
     chunks = []
     current = ""
 
     for s in sentences:
         cand = (current + " " + s).strip()
-        tok = len(llm.tokenize(cand.encode("utf-8")))
+        tok = len(cached_tokenize(cand))
 
         if tok > max_tokens:
             if current:
@@ -113,7 +127,7 @@ def clean_transcript(text: str) -> str:
 
 def categorize_sentences(text: str, language: str):
     todos, solved, suggestions, issues = [], [], [], []
-    sentences = nltk.sent_tokenize(text)
+    sentences = nltk.cached_sent_tokenize(text)
 
     if language == "romanian":
         todo_words = TODO_RO
@@ -149,7 +163,7 @@ def extract_dates(text: str, language: str):
     Return list of (sentence, date_str) for important-ish dates found.
     """
     results = []
-    sentences = nltk.sent_tokenize(text)
+    sentences = nltk.cached_sent_tokenize(text)
     lang_code = "ro" if language == "romanian" else "en"
 
     for s in sentences:
@@ -554,6 +568,7 @@ def process_meetings(input_folder: str, output_folder: str,
         clean = clean_transcript(raw)
         language = detect_language(clean)
         participants = extract_participants(clean)
+        participants = resolve_aliases(participants, clean)
         keywords = extract_keywords(clean, language)
         dates = extract_dates(clean, language)
         todos_h, solved_h, sugg_h, issues_h = categorize_sentences(clean, language)
@@ -567,11 +582,12 @@ def process_meetings(input_folder: str, output_folder: str,
     
         if isinstance(summary_list, list):
             summary_list = filter_items(summary_list)
-            summary = " ".join(summary_list).strip()
+            summary = merge_summaries(summary_list)
         else:
-            summary = summary_list.strip() or " ".join(nltk.sent_tokenize(clean)[:5])
+            summary = summary_list.strip() or " ".join(nltk.cached_sent_tokenize(clean)[:5])
             if "meeting transcript" in summary.lower() or "meeting notes" in summary.lower():
                 summary = ""
+        summary = clean_summary(summary)
 
         # Remove participant names from summary if any participants found
         if participants and summary:
@@ -579,11 +595,15 @@ def process_meetings(input_folder: str, output_folder: str,
                 summary = re.sub(rf"(?:^|(?<=\.|\n))\s*{re.escape(name)}:\s*", "", summary)
 
         keywords = struct.get("keywords", []) or keywords
-        todos = filter_items(struct.get("todo", []) or todos_h)
+        todos_h2, issues_h2, sugg_h2 = heuristic_extract_items(clean)
+        todos = filter_items(struct.get("todo", []) or todos_h or todos_h2)
+        issues = filter_items(struct.get("issues", []) or issues_h or issues_h2)
+        suggestions = filter_items(struct.get("suggestions", []) or sugg_h or sugg_h2)
         solved = filter_items(struct.get("solved", []) or solved_h)
-        issues = filter_items(struct.get("issues", []) or issues_h)
-        suggestions = filter_items(struct.get("suggestions", []) or sugg_h)
         decisions = filter_items(struct.get("decisions", []))
+        deadlines = extract_deadlines(clean)
+        stats = speaker_stats(clean)
+        top_speaker = stats.most_common(1)[0][0] if stats else "N/A"
 
         # Build text output
         txt_lines = []
@@ -630,6 +650,14 @@ def process_meetings(input_folder: str, output_folder: str,
                 txt_lines.append(f"- {d}: {sent}")
         else:
             txt_lines.append("- No important dates mentioned")
+        txt_lines.append("Deadlines:")
+        if deadlines:
+            txt_lines.extend(f"- {d}" for d in deadlines)
+        else:
+            txt_lines.append("- None detected")
+        txt_lines.append("")
+        txt_lines.append(f"Most active speaker: {top_speaker}")
+
 
         txt_content = "\n".join(txt_lines)
         base = f"Summary-{f.stem}"
@@ -688,12 +716,23 @@ def process_meetings(input_folder: str, output_folder: str,
         else:
             doc_out.add_paragraph("No decisions mentioned.")
 
+
         doc_out.add_heading("Important Dates", level=1)
         if dates:
             for sent, d in dates:
                 doc_out.add_paragraph(f"{d}: {sent}", style="List Bullet")
         else:
             doc_out.add_paragraph("No important dates mentioned.")
+
+        doc_out.add_heading("Deadlines", level=1)
+        if deadlines:
+            for d in deadlines:
+                doc_out.add_paragraph(d, style="List Bullet")
+        else:
+            doc_out.add_paragraph("None detected.")
+
+        doc_out.add_heading("Most active speaker", level=1)
+        doc_out.add_paragraph(top_speaker)
 
         docx_path = out_dir / f"{base}.docx"
         doc_out.save(docx_path)
@@ -707,3 +746,219 @@ def process_meetings(input_folder: str, output_folder: str,
         )
 
     return processed
+
+# ==========================================
+#  ENHANCED PARTICIPANT HANDLING
+# ==========================================
+
+def extract_participants(text: str):
+    """
+    Extract participant names from DOCX-style timestamps and VTT-style "Name:" lines.
+    Handles:
+    - First Last   0:06
+    - First Middle Last   12:45
+    - First Last: text
+    - Romanian diacritics
+    """
+
+    participants = set()
+    lines = text.splitlines()
+
+    # Detect docx vs vtt mode
+    has_timestamp = any(re.search(r"\b\d{1,2}:\d{2}\b", ln) for ln in lines)
+    has_colon = any(re.match(r"^[A-ZȘȚĂÂÎ][\wăâîșț]+.*:", ln) for ln in lines)
+
+    # DOCX pattern: "Firstname Lastname   0:45"
+    pattern_docx = re.compile(
+        r"^([A-ZȘȚĂÂÎ][a-zA-ZăâîșțȘȚĂÂÎ]+(?: [A-ZȘȚĂÂÎ][a-zA-ZăâîșțȘȚĂÂÎ]+){0,2})\s+\d{1,2}:\d{2}\b"
+    )
+
+    # VTT pattern: "Firstname Lastname: ..."
+    pattern_vtt = re.compile(
+        r"^([A-ZȘȚĂÂÎ][\wăâîșț]+(?: [A-ZȘȚĂÂÎ][\wăâîșț]+){0,2})\s*:"
+    )
+
+    # DOCX extraction
+    if has_timestamp:
+        for ln in lines:
+            m = pattern_docx.match(ln)
+            if m:
+                participants.add(m.group(1).strip())
+
+    # VTT extraction
+    if has_colon or not participants:
+        for ln in lines:
+            m = pattern_vtt.match(ln)
+            if m:
+                participants.add(m.group(1).strip())
+
+    return sorted(participants)
+
+
+# ==========================================
+#  PARTICIPANT ALIAS RESOLUTION
+# ==========================================
+
+def resolve_aliases(participants, text):
+    """
+    Convert short names into full names.
+    """
+    if not participants:
+        return participants
+
+    first_name_map = {p.split()[0]: p for p in participants}
+    resolved = set()
+
+    for ln in text.splitlines():
+        token = ln.split(":")[0].strip()
+        if token in first_name_map:
+            resolved.add(first_name_map[token])
+
+    return sorted(resolved or participants)
+
+
+# ==========================================
+#  SUMMARY CLEANUP MODULE
+# ==========================================
+
+def clean_summary(summary):
+    """
+    Remove filler words, meeting-control dialog,
+    repeated acknowledgments, and noise.
+    """
+
+    if not summary:
+        return summary
+
+    # Remove conversational fillers
+    summary = re.sub(
+        r"\b(yes|ok|mhm|uh|hm|right|yeah|alright|a bit)\b\.?",
+        "",
+        summary,
+        flags=re.I,
+    )
+
+    # Remove meeting admin chatter
+    summary = re.sub(
+        r"(can you hear me|let me share|hold on|wait a second|starting recording|stopped recording).*",
+        "",
+        summary,
+        flags=re.I
+    )
+
+    # Remove leftover speaker prefixes
+    summary = re.sub(r"^[A-ZȘȚĂÂÎ][\wăâîșț]+:", "", summary)
+
+    # Remove duplicate whitespace
+    summary = " ".join(summary.split())
+
+    return summary.strip()
+
+
+# ==========================================
+#  IMPROVED HEURISTIC TASK + ISSUE FINDER
+# ==========================================
+
+TODO_PHRASES = [
+    r"\bwe need to\b",
+    r"\bshould\b",
+    r"\bmust\b",
+    r"\bto do\b",
+    r"\baction item\b",
+    r"\blet's\b",
+    r"\bde facut\b",
+]
+
+ISSUE_PHRASES = [
+    r"\bproblem\b",
+    r"\berror\b",
+    r"\bblocked\b",
+    r"\bchallenge\b",
+    r"\bissue\b",
+    r"\bnu merge\b",
+]
+
+SUGGESTION_PHRASES = [
+    r"\bpropose\b",
+    r"\bsuggest\b",
+    r"\brecommend\b",
+    r"\bar fi bine\b",
+]
+
+def heuristic_extract_items(text):
+    todos, issues, suggestions = [], [], []
+    sentences = nltk.cached_sent_tokenize(text)
+
+    for s in sentences:
+        low = s.lower()
+
+        if any(re.search(p, low) for p in TODO_PHRASES):
+            todos.append(s)
+
+        if any(re.search(p, low) for p in ISSUE_PHRASES):
+            issues.append(s)
+
+        if any(re.search(p, low) for p in SUGGESTION_PHRASES):
+            suggestions.append(s)
+
+    return todos, issues, suggestions
+
+
+# ==========================================
+#  DEADLINE & DATE IMPROVEMENTS
+# ==========================================
+
+DEADLINE_PATTERNS = [
+    r"\bby (monday|tuesday|wednesday|thursday|friday|tomorrow|end of month)\b",
+    r"\bbefore \d{1,2}/\d{1,2}\b",
+    r"\bdue\b",
+    r"\buntil\b",
+]
+
+def extract_deadlines(text):
+    deadlines = []
+    for pattern in DEADLINE_PATTERNS:
+        for m in re.finditer(pattern, text, flags=re.I):
+            deadlines.append(m.group())
+    return deadlines
+
+
+# ==========================================
+#  SPEAKER STATISTICS
+# ==========================================
+
+def speaker_stats(text):
+    """
+    Count how many speaking turns each participant had.
+    Useful for identifying who dominates the meeting.
+    """
+    stats = Counter()
+    for ln in text.splitlines():
+        if ":" in ln:
+            speaker = ln.split(":")[0].strip()
+            stats[speaker] += 1
+    return stats
+
+
+# ==========================================
+#  SUMMARY MERGING IMPROVEMENT
+# ==========================================
+
+def merge_summaries(summary_list):
+    """
+    Remove redundant sentences and keep only meaningful content.
+    """
+    seen = set()
+    final = []
+
+    for s in summary_list:
+        s = s.strip()
+        if not s:
+            continue
+        if s.lower() in seen:
+            continue
+
+        seen.add(s.lower())
+        final.append(s)
+
+    return " ".join(final)
