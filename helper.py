@@ -294,8 +294,6 @@ def read_vtt(path: Path) -> str:
 
     return "\n".join(cleaned)
 
-
-
 def read_docx(path: Path) -> str:
     doc = docx.Document(path)
     raw = "\n".join(p.text.strip() for p in doc.paragraphs if p.text.strip())
@@ -552,7 +550,22 @@ MEETING TRANSCRIPT:
         else:
             print(f"Chunk {idx+1}: No JSON extracted.")
 
+        # Search for AI suggestion outside JSON
+        ai_sugg_match = re.search(r'AI[_\s]?Suggestion\s*:\s*["“]?(.+?)["”]?\s*$', raw, re.I | re.M)
+        if ai_sugg_match:
+            ai_sugg = ai_sugg_match.group(1).strip()
+            if ai_sugg:
+                combined.setdefault("ai_suggestion", []).append(ai_sugg)
+
     # --- Final merge and cleanup -------------------------------------------
+
+    # Merge all ai_suggestion sources (from JSON and regex extraction)
+    ai_sugg = combined.get("ai_suggestion", [])
+    if isinstance(ai_sugg, str):
+        ai_sugg = [ai_sugg]
+    # Remove empty and duplicate suggestions
+    ai_sugg = [s.strip() for s in ai_sugg if s.strip()]
+    ai_sugg = list(dict.fromkeys(ai_sugg))
 
     final = {
         "summary": " ".join(dict.fromkeys([s for s in combined["summary"] if s.strip()])),
@@ -562,7 +575,7 @@ MEETING TRANSCRIPT:
         "issues": list(dict.fromkeys([i for i in combined["issues"] if i.strip()])),
         "suggestions": list(dict.fromkeys([g for g in combined["suggestions"] if g.strip()])),
         "decisions": list(dict.fromkeys([d for d in combined["decisions"] if d.strip()])),
-        "ai_suggestion": " ".join(dict.fromkeys([s for s in combined.get("ai_suggestion", []) if s.strip()])),
+        "ai_suggestion": " ".join(ai_sugg),
     }
 
     return final
@@ -976,3 +989,212 @@ def merge_summaries(summary_list):
         final.append(s)
 
     return " ".join(final)
+
+###########Will test Monday####################
+import math
+from collections import Counter
+
+def _word_set(text, n_min_len=3):
+    words = re.findall(r"\w+", text.lower())
+    return set(w for w in words if len(w) >= n_min_len)
+
+def _overlap_ratio(small_text, large_text):
+    """
+    proportion of words in small_text that also appear in large_text
+    (used to verify model output actually derives from chunk)
+    """
+    sset = _word_set(small_text)
+    lset = _word_set(large_text)
+    if not sset:
+        return 0.0
+    return len(sset & lset) / len(sset)
+
+def _truncate_after_json(text):
+    """
+    Truncate text after the first complete top-level JSON object (if any),
+    otherwise return original.
+    """
+    start = text.find("{")
+    if start == -1:
+        return text
+    stack = 0
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            stack += 1
+        elif text[i] == "}":
+            stack -= 1
+            if stack == 0:
+                return text[:i+1]
+    return text
+
+def llama_structured_notes_resilient(clean_text: str, language: str, raw_output_path: str) -> dict:
+    """
+    Resilient structured-note extraction:
+    - calls model (chatml expected)
+    - truncates after JSON and extracts JSON
+    - validates JSON by checking overlap with chunk
+    - falls back to heuristics if model output is invalid / echoing instructions
+    """
+    MAX_CHUNK_TOKENS = 1400
+    chunks = chunk_text_llm_safe(clean_text, max_tokens=MAX_CHUNK_TOKENS)
+
+    combined = {k: [] for k in ["summary", "todo", "solved", "issues", "suggestions", "decisions"]}
+    validated_chunks = 0
+
+    # system prompt: strong, minimal, forbid explanation
+    SYSTEM_PROMPT = (
+        "You are an extraction engine. Use ONLY the meeting transcript provided. "
+        "Return EXACTLY one JSON object and nothing else. "
+        "Do NOT add explanations, notes, translations, or comments after the JSON. "
+        "If you cannot extract anything, return empty lists/strings."
+    )
+
+    JSON_SCHEMA = (
+        '{\n'
+        '  "meeting_notes": {\n'
+        '    "summary": "",\n'
+        '    "todo": [],\n'
+        '    "solved": [],\n'
+        '    "issues": [],\n'
+        '    "suggestions": [],\n'
+        '    "decisions": []\n'
+        '  }\n'
+        '}'
+    )
+
+    for idx, chunk in enumerate(chunks):
+        # Compose user prompt: put transcript first, then a *small* schema instruction
+        USER_PROMPT = (
+            f"LANGUAGE: {language}\n\n"
+            "MEETING TRANSCRIPT (use this text ONLY):\n"
+            '"""' + chunk + '"""\n\n'
+            "Now output ONLY a single JSON object with this structure (no extra text):\n"
+            f"{JSON_SCHEMA}\n"
+        )
+
+        # Call LLM (use create_chat_completion if model in chat mode)
+        try:
+            # prefer chat API if available
+            if hasattr(llm, "create_chat_completion"):
+                res = llm.create_chat_completion(
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": USER_PROMPT}
+                    ],
+                    max_tokens=400,
+                    temperature=0.0,
+                    stop=["\n\nNote:", "\n\nThe meeting transcript", "Note:"],
+                )
+                raw = res["choices"][0]["message"]["content"]
+            else:
+                # fallback to raw call (ensure prompt is plain instruction if not chat)
+                res = llm(USER_PROMPT, max_tokens=400, temperature=0.0)
+                # handle both possible schemas
+                if isinstance(res, dict) and "choices" in res and "text" in res["choices"][0]:
+                    raw = res["choices"][0]["text"]
+                else:
+                    raw = str(res)
+        except Exception as e:
+            raw = f"LLM ERROR: {e}"
+
+        # Save raw for debugging
+        if raw_output_path:
+            with open(raw_output_path, "a", encoding="utf-8") as f:
+                f.write(f"\n=== CHUNK {idx+1} RAW ===\n")
+                f.write(raw + "\n")
+
+        # Truncate anything after first JSON to remove explanation garbage
+        truncated = _truncate_after_json(raw)
+        parsed_json = extract_first_json(truncated)
+
+        parsed_ok = False
+        if parsed_json:
+            # flatten JSON if necessary
+            flat = normalize_json_structure(parsed_json)
+
+            # quick sanity: at least one non-empty field or keywords extracted?
+            nonempties = sum(1 for k in ["summary","todo","solved","issues","suggestions","decisions"]
+                              if flat.get(k))
+            # verify content originates from chunk: check overlap for summary + concatenated lists
+            test_text = ""
+            if isinstance(flat.get("summary",""), str):
+                test_text += flat.get("summary","") + " "
+            for k in ["todo","solved","issues","suggestions","decisions"]:
+                val = flat.get(k, [])
+                if isinstance(val, list):
+                    test_text += " ".join(val) + " "
+
+            overlap = _overlap_ratio(test_text, chunk)
+            # Accept parsed result if it has some non-empty fields AND reasonable overlap
+            if nonempties >= 1 and overlap >= 0.05:
+                extract_structured_from_any_json(parsed_json, combined)
+                parsed_ok = True
+                validated_chunks += 1
+            else:
+                # it's likely instruction-echo or not derived from chunk -> discard parsed_json
+                parsed_ok = False
+
+        # If parsed_json was not ok, fallback to heuristics from the chunk
+        if not parsed_ok:
+            # Heuristic summary: first 2-3 meaningful sentences
+            sents = cached_sent_tokenize(chunk) if 'cached_sent_tokenize' in globals() else nltk.sent_tokenize(chunk)
+            heur_summary = " ".join(sents[:3]).strip()
+            heur_todos, heur_issues, heur_suggestions = heuristic_extract_items(chunk)
+
+            # merge heuristics into combined as *fallback*
+            if heur_summary:
+                combined["summary"].append(heur_summary)
+            combined["todo"].extend(heur_todos)
+            combined["issues"].extend(heur_issues)
+            combined["suggestions"].extend(heur_suggestions)
+
+    # FINAL MERGE + DEDUPE + CLEANUP (prefer validated content lengths)
+    def _dedupe_keep_order(lst):
+        seen = set()
+        out = []
+        for x in lst:
+            tx = x.strip()
+            if not tx:
+                continue
+            if tx.lower() in seen:
+                continue
+            seen.add(tx.lower())
+            out.append(tx)
+        return out
+
+    final = {
+        "summary": "",
+        "todo": [],
+        "solved": [],
+        "issues": [],
+        "suggestions": [],
+        "decisions": []
+    }
+
+    # For summary: prefer non-empty validated summaries (longer), else heuristics
+    cand_summaries = [s for s in combined["summary"] if s and len(s.strip())>10]
+    if cand_summaries:
+        # choose the longest unique sentences merged
+        final["summary"] = merge_summaries(cand_summaries)
+    else:
+        final["summary"] = ""
+
+    final["todo"] = _dedupe_keep_order(combined["todo"])
+    final["solved"] = _dedupe_keep_order(combined["solved"])
+    final["issues"] = _dedupe_keep_order(combined["issues"])
+    final["suggestions"] = _dedupe_keep_order(combined["suggestions"])
+    final["decisions"] = _dedupe_keep_order(combined["decisions"])
+
+    # If everything empty, add a helpful fallback: first 3 sentences as summary
+    if not final["summary"]:
+        sents = cached_sent_tokenize(clean_text) if 'cached_sent_tokenize' in globals() else nltk.sent_tokenize(clean_text)
+        final["summary"] = " ".join(sents[:3]).strip()
+
+    # Debug logging
+    if raw_output_path:
+        with open(raw_output_path, "a", encoding="utf-8") as f:
+            f.write("\n=== FINAL EXTRACTED ===\n")
+            f.write(json.dumps(final, ensure_ascii=False, indent=2) + "\n")
+            f.write(f"Validated chunks: {validated_chunks}/{len(chunks)}\n")
+
+    return final
