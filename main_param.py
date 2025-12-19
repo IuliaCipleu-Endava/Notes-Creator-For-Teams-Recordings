@@ -327,78 +327,98 @@ def extract_from_explanation(expl, key):
     return [l for l in lines if l.lower() not in ("rest",)]
 
 def llama_structured_notes(clean_text: str, language: str, raw_output_path: str) -> dict:
+    """
+    Extract structured meeting notes using llama.cpp in ChatML mode.
+    Ensures valid JSON output and merges across multiple chunks.
+    """
+
     MAX_CHUNK_TOKENS = 1400
     chunks = chunk_text_llm_safe(clean_text, max_tokens=MAX_CHUNK_TOKENS)
 
     combined = {k: [] for k in
-                ["summary","todo","solved","issues","suggestions","decisions"]}
+                ["summary", "todo", "solved", "issues", "suggestions", "decisions"]}
 
-    for idx, chunk in enumerate(chunks):
-        prompt = f"""
-Extract structured meeting notes from the following text.
+    # --- Utility functions --------------------------------------------------
 
-Return:
-1) A JSON object containing summary, todo, solved, issues, suggestions, decisions, following the structure:
+    def strip_fences(text: str) -> str:
+        """Remove ```json or ``` wrappers."""
+        text = text.strip()
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+        text = re.sub(r"```$", "", text)
+        return text.strip()
+
+    def safe_json_extract(text: str):
+        """Return first valid JSON found, or None."""
+        text = strip_fences(text)
+        return extract_first_json(text)
+
+    # --- Chat prompts -------------------------------------------------------
+
+    SYSTEM_PROMPT = (
+        "You are an AI assistant that extracts structured JSON from meeting transcripts. "
+        "You MUST return ONLY valid JSON. "
+        "No explanations, no commentary, no text outside of JSON."
+    )
+
+    JSON_SCHEMA = """
 {
-    "meeting_notes": {
-        "summary": "",
-        "todo": [],
-        "solved": [],
-        "issues": [],
-        "suggestions": [],
-        "decisions": []
-    }
+  "meeting_notes": {
+    "summary": "",
+    "todo": [],
+    "solved": [],
+    "issues": [],
+    "suggestions": [],
+    "decisions": []
+  }
 }
-2) No additional explanation.
-
-Text:
-\"\"\"{chunk}\"\"\"
-
-JSON:
 """
 
-        res = llm(
-            prompt,
-            max_tokens=300,
+    # --- Main loop ----------------------------------------------------------
+
+    for idx, chunk in enumerate(chunks):
+
+        USER_PROMPT = f"""
+LANGUAGE: {language}
+
+Extract structured meeting notes from the following transcript chunk.
+
+Return ONLY valid JSON in this exact structure:
+{JSON_SCHEMA}
+
+MEETING TRANSCRIPT:
+\"\"\"{chunk}\"\"\"
+"""
+
+        # Call llama in ChatML mode
+        res = llm.create_chat_completion(
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": USER_PROMPT}
+            ],
+            max_tokens=400,
             temperature=0.0,
-            top_p=1.0,
-            repeat_penalty=1.1
         )
 
-        raw = res["choices"][0]["text"]
+        raw = res["choices"][0]["message"]["content"]
+        raw_clean = strip_fences(raw)
 
         print(f"\n=== RAW OUTPUT CHUNK {idx+1} ===")
         print(raw)
+
         if raw_output_path:
             with open(raw_output_path, "a", encoding="utf-8") as f:
-                f.write(f"\n=== CHUNK {idx+1} ===\n")
-                f.write(raw + "\n")
-        # --------------------------
-        # PART 1: JSON extraction
-        # --------------------------
-        parsed_json = extract_first_json(raw)
-        if parsed_json:
-            extract_structured_from_any_json(parsed_json, combined)
+                f.write(f"\n=== CHUNK {idx+1} ===\n{raw}\n")
+
+        # Attempt JSON extraction
+        parsed = safe_json_extract(raw_clean)
+        if parsed:
+            extract_structured_from_any_json(parsed, combined)
             print(f"Chunk {idx+1}: JSON extracted.")
         else:
             print(f"Chunk {idx+1}: No JSON extracted.")
 
-        # --------------------------
-        # PART 2: Explanation parsing
-        # --------------------------
-        if "Explanation:" in raw:
-            expl = raw.split("Explanation:", 1)[1]
+    # --- Final merge and cleanup -------------------------------------------
 
-            combined["summary"].extend(extract_from_explanation(expl, "Summary"))
-            combined["todo"].extend(extract_from_explanation(expl, "Todo"))
-            combined["solved"].extend(extract_from_explanation(expl, "Solved"))
-            combined["issues"].extend(extract_from_explanation(expl, "Issues"))
-            combined["suggestions"].extend(extract_from_explanation(expl, "Suggestions"))
-            combined["decisions"].extend(extract_from_explanation(expl, "Decisions"))
-
-    # --------------------------
-    # FINAL MERGE + CLEANUP
-    # --------------------------
     final = {
         "summary": " ".join(dict.fromkeys([s for s in combined["summary"] if s.strip()])),
         "todo": list(dict.fromkeys([t for t in combined["todo"] if t.strip()])),
