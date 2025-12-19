@@ -380,7 +380,7 @@ def llama_structured_notes(clean_text: str, language: str, raw_output_path: str)
     chunks = chunk_text_llm_safe(clean_text, max_tokens=MAX_CHUNK_TOKENS)
 
     combined = {k: [] for k in
-                ["summary", "todo", "solved", "issues", "suggestions", "decisions"]}
+                ["summary", "keywords", "todo", "solved", "issues", "suggestions", "decisions"]}
 
     # --- Utility functions --------------------------------------------------
 
@@ -401,6 +401,7 @@ def llama_structured_notes(clean_text: str, language: str, raw_output_path: str)
     SYSTEM_PROMPT = (
         "You are an AI assistant that extracts structured JSON from meeting transcripts. "
         "You MUST return ONLY valid JSON. "
+        "For the keywords fields, return at most 3 keywords. "
         "No explanations, no commentary, no text outside of JSON."
     )
 
@@ -408,6 +409,7 @@ def llama_structured_notes(clean_text: str, language: str, raw_output_path: str)
 {
   "meeting_notes": {
     "summary": "",
+    "keywords": [],
     "todo": [],
     "solved": [],
     "issues": [],
@@ -465,6 +467,7 @@ MEETING TRANSCRIPT:
 
     final = {
         "summary": " ".join(dict.fromkeys([s for s in combined["summary"] if s.strip()])),
+        "keywords": list(dict.fromkeys([k for k in combined["keywords"] if k.strip()])),
         "todo": list(dict.fromkeys([t for t in combined["todo"] if t.strip()])),
         "solved": list(dict.fromkeys([s for s in combined["solved"] if s.strip()])),
         "issues": list(dict.fromkeys([i for i in combined["issues"] if i.strip()])),
@@ -524,6 +527,12 @@ def process_meetings(input_folder: str, output_folder: str,
         else:
             summary = summary_list.strip() or " ".join(nltk.sent_tokenize(clean)[:5])
 
+        # Remove participant names from summary if any participants found
+        if participants and summary:
+            for name in participants:
+                # Remove 'Name:' at the start or after a period, with or without spaces
+                summary = re.sub(rf"(?:^|(?<=\.|\n))\s*{re.escape(name)}:\s*", "", summary)
+        keywords = struct.get("keywords", []) or keywords
         todos = struct.get("todo", []) or todos_h
         solved = struct.get("solved", []) or solved_h
         issues = struct.get("issues", []) or issues_h
