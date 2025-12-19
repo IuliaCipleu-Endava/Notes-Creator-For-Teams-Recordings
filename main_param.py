@@ -172,52 +172,96 @@ def extract_dates(text: str, language: str):
 
 def read_vtt(path: Path) -> str:
     """
-    Clean Teams .vtt files:
-    - Remove headers, NOTE, cue IDs, timecodes
-    - Extract <v Speaker>Text</v> to "Speaker: Text"
+    Robust cleaner for Microsoft Teams .vtt transcripts.
+    Handles:
+    - WEBVTT headers, NOTE blocks
+    - Cue IDs, numeric lines
+    - Timecodes
+    - <v Speaker>…</v> blocks
+    - Continuation lines for speakers
+    - Removes GUID fragments, formatting artifacts, <c> tags
+    - Removes zero-width spaces & stray tokens
+    - Ignores garbage-only lines
     """
     lines = []
     current_speaker = None
+
+    guid_pattern = re.compile(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:/\d+-\d+)?",
+        re.I
+    )
 
     with open(path, encoding="utf-8") as f:
         for raw in f:
             line = raw.strip()
 
-            if not line:
+            # Skip empties, headers, NOTES
+            if not line or line == "WEBVTT" or line.startswith("NOTE"):
                 continue
-            if line == "WEBVTT":
+
+            # Remove zero-width spaces
+            line = line.replace("\u200b", "")
+
+            # Remove speaker styling <c.colorXXXXXX>
+            line = re.sub(r"<c[^>]*>", "", line)
+            line = line.replace("</c>", "")
+
+            # Remove GUID fragments
+            line = guid_pattern.sub("", line).strip()
+
+            # Skip pure garbage lines like: 11-0, 0/0, 39-1
+            if re.fullmatch(r"[\d/.-]+", line):
                 continue
-            if line.startswith("NOTE"):
-                continue
-            if line.isdigit():  # numeric cue IDs
-                continue
+
+            # Skip timecodes (00:00:00.000 --> 00:00:00.000)
             if re.match(r"\d{2}:\d{2}:\d{2}\.\d{3} -->", line):
                 continue
 
+            # Remove inline timestamps inside text
+            line = re.sub(r"<\d{2}:\d{2}:\d{2}\.\d{3}>", "", line)
+
+            # Full <v>…</v> on one line
             m = re.match(r"<v ([^>]+)>(.*?)</v>", line)
             if m:
-                speaker = m.group(1).strip().split(".")[0]
+                speaker = m.group(1).split(".")[0].strip()
                 text = m.group(2).strip()
-                lines.append(f"{speaker}: {text}")
+                if text:
+                    lines.append(f"{speaker}: {text}")
                 current_speaker = speaker
                 continue
 
+            # Opening <v Speaker> without closing
             m = re.match(r"<v ([^>]+)>(.*)", line)
             if m:
-                current_speaker = m.group(1).strip().split(".")[0]
-                rest = m.group(2).strip()
-                if rest:
-                    lines.append(f"{current_speaker}: {rest}")
+                speaker = m.group(1).split(".")[0].strip()
+                text = m.group(2).strip()
+                current_speaker = speaker
+                if text:
+                    lines.append(f"{speaker}: {text}")
                 continue
 
+            # Continuation line for current speaker
             if current_speaker:
-                lines.append(f"{current_speaker}: {line}")
+                if line not in ("</v>",):
+                    lines.append(f"{current_speaker}: {line}")
                 continue
 
+            # Fallback: treat as generic text line
             lines.append(line)
 
-    cleaned = [ln.replace("</v>", "").strip() for ln in lines if ln.strip()]
+    # Cleanup: remove empty lines, stray </v>, double prefixes
+    cleaned = []
+    for ln in lines:
+        ln = ln.replace("</v>", "").strip()
+
+        # Remove accidental duplication: "Speaker: Speaker: text"
+        ln = re.sub(r"^([^:]+):\s*\1:\s*", r"\1: ", ln)
+
+        if ln:
+            cleaned.append(ln)
+
     return "\n".join(cleaned)
+
 
 
 def read_docx(path: Path) -> str:
