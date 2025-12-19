@@ -7,33 +7,43 @@ from pathlib import Path
 from collections import Counter
 from langdetect import detect, DetectorFactory
 import dateparser
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+from llama_cpp import Llama  # GGUF / llama.cpp backend
 
 DetectorFactory.seed = 0
 nltk.download("punkt", quiet=False)
-from transformers import AutoTokenizer, AutoModelForCausalLM
-import torch
 
-# Load Phi-2 model
-print("Loading Phi-2 model... (first time may take ~30s)")
-phi_tokenizer = AutoTokenizer.from_pretrained("microsoft/phi-2", trust_remote_code=True)
-phi_model = AutoModelForCausalLM.from_pretrained(
-    "microsoft/phi-2",
-    torch_dtype=torch.float32,   # CPU-friendly
-    trust_remote_code=True
+# -------------------------------------------------------------------
+# 1. MODEL LOADING (GGUF / llama.cpp)
+# -------------------------------------------------------------------
+# Change this to your actual GGUF path
+GGUF_MODEL_PATH = r"C:\Users\icipleu\OneDrive - ENDAVA\Documents\Data Project\Notes_Creator_For_Teams_Recordings\dolphin-2_6-phi-2_oasst2_chatml_v2.q4_k_m.gguf"
+
+print("Loading GGUF model (phi-2)…")
+llm = Llama(
+    model_path=GGUF_MODEL_PATH,
+    n_ctx=2048,  # match training context
+    n_threads=6,
+    n_gpu_layers=0,
+    verbose=False,
 )
 
-def load_wordlist(path):
-    if not Path(path).exists():
+print("Model loaded.")
+
+# -------------------------------------------------------------------
+# 2. CONFIG / WORDLISTS
+# -------------------------------------------------------------------
+CONFIG_DIR = Path("config")
+
+
+def load_wordlist(path: Path):
+    if not path.exists():
         return []
     with open(path, encoding="utf-8") as f:
         return [ln.strip() for ln in f if ln.strip()]
 
-
-# -------------------------------------
-# STOPWORDS
-# -------------------------------------
-
-CONFIG_DIR = Path("config")
 
 STOPWORDS_RO = set(load_wordlist(CONFIG_DIR / "stopwords_ro.txt"))
 STOPWORDS_EN = set(load_wordlist(CONFIG_DIR / "stopwords_en.txt"))
@@ -50,107 +60,66 @@ SUGGEST_EN = load_wordlist(CONFIG_DIR / "suggestions_keywords_en.txt")
 ISSUES_RO = load_wordlist(CONFIG_DIR / "issues_keywords_ro.txt")
 ISSUES_EN = load_wordlist(CONFIG_DIR / "issues_keywords_en.txt")
 
-
-# -------------------------------------
-# HELPERS
-# -------------------------------------
-def detect_language(text):
+# -------------------------------------------------------------------
+# 3. HELPERS
+# -------------------------------------------------------------------
+def detect_language(text: str) -> str:
     try:
         return "romanian" if detect(text) == "ro" else "english"
-    except:
+    except Exception:
         return "english"
-    
-def phi_generate(prompt, max_tokens=512):
-    inputs = phi_tokenizer(prompt, return_tensors="pt")
-    outputs = phi_model.generate(
-        **inputs,
-        max_new_tokens=max_tokens,
-        do_sample=False,
-    )
-    return phi_tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-def extract_dates(text, language="english"):
-    """
-    Extract absolute and relative dates from transcript text
-    and return them normalized.
-    """
-    detected = set()
-    results = []
+def count_tokens(text):
+    return len(llm.tokenize(text.encode("utf-8")))
 
-    # Split into sentences (helps avoid duplicate parsing)
+def chunk_text_llm_safe(text, max_tokens=1400):
+    """
+    Split text into chunks guaranteed to fit the model's context window.
+    """
     sentences = nltk.sent_tokenize(text)
+    chunks = []
+    current = ""
 
     for s in sentences:
-        # Use dateparser with multilingual support
-        dt = dateparser.parse(
-            s,
-            languages=['ro', 'en'],
-            settings={
-                "PREFER_DATES_FROM": "future",
-                "RELATIVE_BASE": None,
-            }
-        )
-        if dt:
-            # Avoid duplicates and nonsense (like all sentences detecting "now")
-            key = dt.date().isoformat()
-            if key not in detected:
-                detected.add(key)
-                results.append((s, dt.date()))
+        cand = (current + " " + s).strip()
+        tok = len(llm.tokenize(cand.encode("utf-8")))
 
-    return results
+        if tok > max_tokens:
+            if current:
+                chunks.append(current)
+            current = s
+        else:
+            current = cand
 
-def extract_with_phi(clean_text, language):
-    prompt = f"""
-You are an assistant that extracts structured meeting notes.
+    if current:
+        chunks.append(current)
+    print(f"Text chunked into {len(chunks)} parts for LLM processing.")
+    return chunks
 
-Meeting transcript:
-{clean_text}
 
-Return only JSON with fields:
-- summary
-- todo
-- solved
-- issues
-- suggestions
-- decisions
 
-Use Romanian or English depending on input.
-"""
-
-    result = phi_generate(prompt, max_tokens=300)
-
-    # Try to extract the JSON from the model output
-    match = re.search(r"\{.*\}", result, flags=re.S)
-    if match:
-        return match.group(0)
-    else:
-        return result
-
-def extract_keywords(text, language="english", n=5):
+def extract_keywords(text: str, language="english", n=5):
     words = nltk.word_tokenize(text.lower())
     words = [w for w in words if w.isalnum()]
-
     stop = STOPWORDS_RO if language == "romanian" else STOPWORDS_EN
     words = [w for w in words if w not in stop and len(w) > 3]
-
     freq = Counter(words)
     return [w for w, _ in freq.most_common(n)]
 
-def clean_transcript(text):
+
+def clean_transcript(text: str) -> str:
     lines = text.split("\n")
     lines = [ln.strip() for ln in lines if ln.strip()]
     lines = [ln for ln in lines if "transcription" not in ln.lower()]
-
     cleaned = []
     for ln in lines:
         ln = re.sub(r"\s+\d+:\d+", "", ln).strip()
         cleaned.append(ln)
-
     return "\n".join(cleaned)
 
-def categorize_sentences(text, language):
-    todos, solved, suggestions, issues = [], [], [], []
 
+def categorize_sentences(text: str, language: str):
+    todos, solved, suggestions, issues = [], [], [], []
     sentences = nltk.sent_tokenize(text)
 
     if language == "romanian":
@@ -166,19 +135,15 @@ def categorize_sentences(text, language):
 
     for s in sentences:
         low = s.lower()
-
         if any(w in low for w in todo_words):
             todos.append(s)
             continue
-        
         if any(w in low for w in solved_words):
             solved.append(s)
             continue
-        
         if any(w in low for w in suggestion_words):
             suggestions.append(s)
             continue
-        
         if any(w in low for w in issue_words):
             issues.append(s)
             continue
@@ -186,15 +151,30 @@ def categorize_sentences(text, language):
     return todos, solved, suggestions, issues
 
 
-def read_vtt(path: Path):
+def extract_dates(text: str, language: str):
+    """
+    Return list of (sentence, date_str) for important-ish dates found.
+    """
+    results = []
+    sentences = nltk.sent_tokenize(text)
+    lang_code = "ro" if language == "romanian" else "en"
+
+    for s in sentences:
+        dt = dateparser.parse(
+            s,
+            settings={"PREFER_DATES_FROM": "future"},
+            languages=[lang_code],
+        )
+        if dt:
+            results.append((s, dt.strftime("%Y-%m-%d %H:%M")))
+    return results
+
+
+def read_vtt(path: Path) -> str:
     """
     Clean Teams .vtt files:
-    - Remove WEBVTT headers
-    - Remove NOTE blocks
-    - Remove numeric cue IDs
-    - Remove timecode lines
-    - Extract <v Speaker>Text</v>
-    - Merge with previous speaker if needed
+    - Remove headers, NOTE, cue IDs, timecodes
+    - Extract <v Speaker>Text</v> to "Speaker: Text"
     """
     lines = []
     current_speaker = None
@@ -209,107 +189,246 @@ def read_vtt(path: Path):
                 continue
             if line.startswith("NOTE"):
                 continue
-
-            # Remove line numbers like "1", "2", "3", etc.
-            if line.isdigit():
+            if line.isdigit():  # numeric cue IDs
                 continue
-
-            # Skip timecodes
             if re.match(r"\d{2}:\d{2}:\d{2}\.\d{3} -->", line):
                 continue
 
-            # Full <v Speaker>Text</v>
             m = re.match(r"<v ([^>]+)>(.*?)</v>", line)
             if m:
-                speaker = m.group(1).strip()
-                speaker = speaker.split(".")[0]
+                speaker = m.group(1).strip().split(".")[0]
                 text = m.group(2).strip()
                 lines.append(f"{speaker}: {text}")
                 current_speaker = speaker
                 continue
 
-            # <v Speaker>Text (no closing tag)
             m = re.match(r"<v ([^>]+)>(.*)", line)
             if m:
-                current_speaker = m.group(1).strip()
+                current_speaker = m.group(1).strip().split(".")[0]
                 rest = m.group(2).strip()
                 if rest:
                     lines.append(f"{current_speaker}: {rest}")
                 continue
 
-            # Continuation of previous speaker
             if current_speaker:
                 lines.append(f"{current_speaker}: {line}")
                 continue
 
-            # Fallback (rare)
             lines.append(line)
 
-    # Final clean-up
-    cleaned = []
-    for ln in lines:
-        ln = ln.replace("</v>", "").strip()
-        cleaned.append(ln)
-
+    cleaned = [ln.replace("</v>", "").strip() for ln in lines if ln.strip()]
     return "\n".join(cleaned)
 
 
-def read_docx(path: Path):
+def read_docx(path: Path) -> str:
     doc = docx.Document(path)
     raw = "\n".join(p.text.strip() for p in doc.paragraphs if p.text.strip())
-
-    # Remove started/stopped transcription
     raw = re.sub(r"started transcription", "", raw, flags=re.I)
     raw = re.sub(r"stopped transcription", "", raw, flags=re.I)
-
-    # Remove timestamps (0:11)
     raw = re.sub(r"\b\d{1,2}:\d{2}\b", "", raw)
-
-    # Remove multiple blank lines
     raw = re.sub(r"\n{2,}", "\n", raw)
-
     return raw.strip()
 
 
-
-def extract_participants(text):
+def extract_participants(text: str):
     participants = set()
-
     for line in text.splitlines():
-        # Name:
         m = re.match(r"^([A-ZȘȚĂÂÎ][\wăâîșț]+(?: [A-ZȘȚĂÂÎ][\wăâîșț]+)*)\s*:", line)
         if m:
             participants.add(m.group(1))
             continue
-
-        # Name timestamp
-        m = re.match(r"^([A-ZȘȚĂÂÎ][\wăâîșț]+(?: [A-ZȘȚĂÂÎ][\wăâîșț]+)*)\s+\d{1,2}:\d{2}", line)
-        if m:
-            participants.add(m.group(1))
-            continue
-
     return sorted(participants)
 
-# -------------------------------------
-# MAIN
-# -------------------------------------
-def main():
-    args = sys.argv
+def normalize_json_structure(parsed):
+    """
+    Accepts both:
+    {
+      "summary": "...",
+      "todo": [...]
+    }
 
-    TRANSCRIPTS_FOLDER = Path(args[1])
-    OUTPUT_FOLDER = Path(args[2])
-    PREV = int(args[3]) if len(args) > 3 else 0
-    CURR = int(args[4]) if len(args) > 4 else 0
+    and:
+    {
+      "meeting_notes": {
+          "summary": "...",
+          "todo": [...]
+      }
+    }
 
-    OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
+    Returns flat dict:
+    {
+      "summary": "...",
+      "todo": [...],
+      ...
+    }
+    """
+    if "meeting_notes" in parsed and isinstance(parsed["meeting_notes"], dict):
+        # flatten
+        return parsed["meeting_notes"]
 
-    # Number of new files to process
-    N_FILES = max(CURR - PREV, 1)
+    return parsed  # already flat
 
-    # Collect docx + vtt
-    files = list(TRANSCRIPTS_FOLDER.glob("*.docx")) + list(TRANSCRIPTS_FOLDER.glob("*.vtt"))
+def extract_first_json(text):
+    start = text.find("{")
+    if start == -1:
+        return None
+
+    stack = 0
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            stack += 1
+        elif text[i] == "}":
+            stack -= 1
+            if stack == 0:
+                try:
+                    return json.loads(text[start:i+1])
+                except:
+                    return None
+    return None
+
+def extract_structured_from_any_json(obj, result):
+    """
+    Recursively merge structured meeting fields from ANY JSON shape.
+    Supports:
+    - nested dicts
+    - lists of dicts
+    - meeting_notes wrappers
+    - title + lists
+    - JSON with missing keys
+    """
+    if isinstance(obj, dict):
+        for key in ["summary", "todo", "solved", "issues", "suggestions", "decisions"]:
+            if key in obj:
+                val = obj[key]
+                if key == "summary" and isinstance(val, str):
+                    result["summary"].append(val)
+                elif isinstance(val, list):
+                    result[key].extend(v for v in val if isinstance(v, str))
+        for v in obj.values():
+            extract_structured_from_any_json(v, result)
+
+    elif isinstance(obj, list):
+        for item in obj:
+            extract_structured_from_any_json(item, result)
+
+def extract_from_explanation(expl, key):
+    """
+    Extract sections like:
+    Summary: ...
+    Todo: ...
+    Issues: ...
+    """
+    pattern = rf"{key}:(.*?)(?=\n[A-Z][a-z]+:|$)"
+    m = re.search(pattern, expl, re.S)
+    if not m:
+        return []
+    lines = [ln.strip(" -") for ln in m.group(1).split("\n") if ln.strip()]
+    # remove garbage lines like "Rest"
+    return [l for l in lines if l.lower() not in ("rest",)]
+
+def llama_structured_notes(clean_text: str, language: str, raw_output_path: str) -> dict:
+    MAX_CHUNK_TOKENS = 1400
+    chunks = chunk_text_llm_safe(clean_text, max_tokens=MAX_CHUNK_TOKENS)
+
+    combined = {k: [] for k in
+                ["summary","todo","solved","issues","suggestions","decisions"]}
+
+    for idx, chunk in enumerate(chunks):
+        prompt = f"""
+Extract structured meeting notes from the following text.
+
+Return:
+1) A JSON object containing summary, todo, solved, issues, suggestions, decisions, following the structure:
+{
+    "meeting_notes": {
+        "summary": "",
+        "todo": [],
+        "solved": [],
+        "issues": [],
+        "suggestions": [],
+        "decisions": []
+    }
+}
+2) No additional explanation.
+
+Text:
+\"\"\"{chunk}\"\"\"
+
+JSON:
+"""
+
+        res = llm(
+            prompt,
+            max_tokens=300,
+            temperature=0.0,
+            top_p=1.0,
+            repeat_penalty=1.1
+        )
+
+        raw = res["choices"][0]["text"]
+
+        print(f"\n=== RAW OUTPUT CHUNK {idx+1} ===")
+        print(raw)
+        if raw_output_path:
+            with open(raw_output_path, "a", encoding="utf-8") as f:
+                f.write(f"\n=== CHUNK {idx+1} ===\n")
+                f.write(raw + "\n")
+        # --------------------------
+        # PART 1: JSON extraction
+        # --------------------------
+        parsed_json = extract_first_json(raw)
+        if parsed_json:
+            extract_structured_from_any_json(parsed_json, combined)
+            print(f"Chunk {idx+1}: JSON extracted.")
+        else:
+            print(f"Chunk {idx+1}: No JSON extracted.")
+
+        # --------------------------
+        # PART 2: Explanation parsing
+        # --------------------------
+        if "Explanation:" in raw:
+            expl = raw.split("Explanation:", 1)[1]
+
+            combined["summary"].extend(extract_from_explanation(expl, "Summary"))
+            combined["todo"].extend(extract_from_explanation(expl, "Todo"))
+            combined["solved"].extend(extract_from_explanation(expl, "Solved"))
+            combined["issues"].extend(extract_from_explanation(expl, "Issues"))
+            combined["suggestions"].extend(extract_from_explanation(expl, "Suggestions"))
+            combined["decisions"].extend(extract_from_explanation(expl, "Decisions"))
+
+    # --------------------------
+    # FINAL MERGE + CLEANUP
+    # --------------------------
+    final = {
+        "summary": " ".join(dict.fromkeys([s for s in combined["summary"] if s.strip()])),
+        "todo": list(dict.fromkeys([t for t in combined["todo"] if t.strip()])),
+        "solved": list(dict.fromkeys([s for s in combined["solved"] if s.strip()])),
+        "issues": list(dict.fromkeys([i for i in combined["issues"] if i.strip()])),
+        "suggestions": list(dict.fromkeys([g for g in combined["suggestions"] if g.strip()])),
+        "decisions": list(dict.fromkeys([d for d in combined["decisions"] if d.strip()])),
+    }
+
+    return final
+
+
+# -------------------------------------------------------------------
+# 4. CORE PROCESSING (what used to be main())
+# -------------------------------------------------------------------
+def process_meetings(input_folder: str, output_folder: str,
+                     previous_count: int, current_count: int):
+
+    in_dir = Path(input_folder)
+    out_dir = Path(output_folder)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    n_files = max(current_count - previous_count, 1)
+
+    # latest N .docx + .vtt
+    files = list(in_dir.glob("*.docx")) + list(in_dir.glob("*.vtt"))
     files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
-    files_to_process = files[:N_FILES]
+    files_to_process = files[:n_files]
+
+    processed = []
 
     for f in files_to_process:
         print(f"Processing: {f.name}")
@@ -323,146 +442,199 @@ def main():
             print("Empty transcript.")
             continue
 
-        heuristic_clean = clean_transcript(raw)
-        heuristic_language = detect_language(heuristic_clean)
-        important_dates = extract_dates(heuristic_clean, heuristic_language)
-        heuristic_participants = extract_participants(heuristic_clean)
-        heuristic_todos, heuristic_solved, heuristic_suggestions, heuristic_issues = categorize_sentences(heuristic_clean, heuristic_language)
-        phi_struct = extract_with_phi(heuristic_clean, heuristic_language)
-        print("Phi-2 structured extraction:")
-        print(phi_struct)
-        
-        sentences = nltk.sent_tokenize(heuristic_clean)
-        summary = " ".join(sentences[:5])
+        clean = clean_transcript(raw)
+        language = detect_language(clean)
+        participants = extract_participants(clean)
+        keywords = extract_keywords(clean, language)
+        dates = extract_dates(clean, language)
+        todos_h, solved_h, sugg_h, issues_h = categorize_sentences(clean, language)
 
-        keywords = extract_keywords(heuristic_clean, heuristic_language)
+        # Ask GGUF model for structured info
+        raw_path = out_dir / f"Summary-{f.stem}.raw.txt"
+        struct = llama_structured_notes(clean, language, raw_output_path=raw_path)
 
-        try:
-            data = json.loads(phi_struct)
-            summary = data.get("summary", "")
-            todos = data.get("todo", [])
-            solved = data.get("solved", [])
-            issues = data.get("issues", [])
-            suggestions = data.get("suggestions", [])
-        except:
-            summary = summary           # fallback to extractive
-            todos = heuristic_todos
-            solved = heuristic_solved
-            issues = heuristic_issues
-            suggestions = heuristic_suggestions
-
-        # Build output
-        txt = []
-        txt.append("--- Meeting Notes Summary ---")
-        txt.append(f"Language: {heuristic_language.capitalize()}")
-        txt.append(f"Participants: {', '.join(heuristic_participants) if heuristic_participants else 'N/A'}")
-        txt.append("")
-        
-        # --- Keywords ---
-        txt.append("Key Points:")
-        txt.extend(f"- {kw}" for kw in keywords)
-
-        # --- Summary ---
-        txt.append("Summary:")
-        txt.append(summary)
-        txt.append("")
-
-        # --- Action Items / To Do ---
-        txt.append("To Do:")
-        if todos:
-            txt.extend(f"- {t}" for t in todos)
+        # Merge heuristic + model (model preferred, heuristics as backup)
+        summary_list = struct.get("summary", [])
+        if isinstance(summary_list, list):
+            summary = " ".join(summary_list).strip()
         else:
-            txt.append("- None identified")
-        txt.append("")
+            summary = summary_list.strip() or " ".join(nltk.sent_tokenize(clean)[:5])
 
-        # --- Solved ---
-        txt.append("Solved / Completed:")
-        if solved:
-            txt.extend(f"- {s}" for s in solved)
+        todos = struct.get("todo", []) or todos_h
+        solved = struct.get("solved", []) or solved_h
+        issues = struct.get("issues", []) or issues_h
+        suggestions = struct.get("suggestions", []) or sugg_h
+        decisions = struct.get("decisions", [])
+
+        # Build text output
+        txt_lines = []
+        txt_lines.append("--- Meeting Notes Summary ---")
+        txt_lines.append(f"Language: {language.capitalize()}")
+        txt_lines.append(
+            f"Participants: {', '.join(participants) if participants else 'N/A'}"
+        )
+        txt_lines.append("")
+        txt_lines.append("Key Points:")
+        txt_lines.extend(f"- {kw}" for kw in keywords)
+        txt_lines.append("")
+        txt_lines.append("Summary:")
+        txt_lines.append(summary)
+        txt_lines.append("")
+        txt_lines.append("To Do:")
+        txt_lines.extend(f"- {t}" for t in todos) if todos else txt_lines.append(
+            "- None identified"
+        )
+        txt_lines.append("")
+        txt_lines.append("Solved / Completed:")
+        txt_lines.extend(f"- {s}" for s in solved) if solved else txt_lines.append(
+            "- None mentioned"
+        )
+        txt_lines.append("")
+        txt_lines.append("Suggestions:")
+        txt_lines.extend(f"- {s}" for s in suggestions) if suggestions else txt_lines.append(
+            "- None identified"
+        )
+        txt_lines.append("")
+        txt_lines.append("Issues:")
+        txt_lines.extend(f"- {i}" for i in issues) if issues else txt_lines.append(
+            "- No issues flagged"
+        )
+        txt_lines.append("")
+        txt_lines.append("Decisions:")
+        txt_lines.extend(f"- {d}" for d in decisions) if decisions else txt_lines.append(
+            "- None identified"
+        )
+        txt_lines.append("")
+        txt_lines.append("Important Dates:")
+        if dates:
+            for sent, d in dates:
+                txt_lines.append(f"- {d}: {sent}")
         else:
-            txt.append("- None mentioned")
-        txt.append("")
+            txt_lines.append("- No important dates mentioned")
 
-        # --- Suggestions ---
-        txt.append("Suggestions:")
-        if suggestions:
-            txt.extend(f"- {sg}" for sg in suggestions)
-        else:
-            txt.append("- None identified")
-        txt.append("")
-
-        # --- Issues / Problems ---
-        txt.append("Issues:")
-        if issues:
-            txt.extend(f"- {i}" for i in issues)
-        else:
-            txt.append("- No issues flagged")
-        txt.append("")
-        
-        txt.append("Important Dates:")
-        if important_dates:
-            for sent, d in important_dates:
-                txt.append(f"- {d}: {sent}")
-        else:
-            txt.append("- No important dates mentioned")
-        txt.append("")
-
-        final_txt = "\n".join(txt)
-
+        txt_content = "\n".join(txt_lines)
         base = f"Summary-{f.stem}"
 
         # Save TXT
-        (OUTPUT_FOLDER / f"{base}.txt").write_text(final_txt, encoding="utf-8")
+        txt_path = out_dir / f"{base}.txt"
+        txt_path.write_text(txt_content, encoding="utf-8")
 
         # Save DOCX
         doc_out = docx.Document()
         doc_out.add_heading("Meeting Notes Summary", level=0)
         doc_out.add_heading("Language", level=1)
-        doc_out.add_paragraph(heuristic_language.capitalize())
+        doc_out.add_paragraph(language.capitalize())
         doc_out.add_heading("Participants", level=1)
-        doc_out.add_paragraph(", ".join(heuristic_participants) if heuristic_participants else "N/A")
-        doc_out.add_heading("Summary", level=1)
-        doc_out.add_paragraph(summary)
+        doc_out.add_paragraph(", ".join(participants) if participants else "N/A")
+
         doc_out.add_heading("Key Points", level=1)
         for kw in keywords:
             doc_out.add_paragraph(kw, style="List Bullet")
+
+        doc_out.add_heading("Summary", level=1)
+        doc_out.add_paragraph(summary)
+
         doc_out.add_heading("To Do", level=1)
         if todos:
-            for t in todos: doc_out.add_paragraph(t, style="List Bullet")
+            for t in todos:
+                doc_out.add_paragraph(t, style="List Bullet")
         else:
             doc_out.add_paragraph("No action items identified.")
 
         doc_out.add_heading("Solved / Completed", level=1)
         if solved:
-            for s in solved: doc_out.add_paragraph(s, style="List Bullet")
+            for s in solved:
+                doc_out.add_paragraph(s, style="List Bullet")
         else:
             doc_out.add_paragraph("None mentioned.")
 
         doc_out.add_heading("Suggestions", level=1)
         if suggestions:
-            for s in suggestions: doc_out.add_paragraph(s, style="List Bullet")
+            for s in suggestions:
+                doc_out.add_paragraph(s, style="List Bullet")
         else:
             doc_out.add_paragraph("No suggestions mentioned.")
 
         doc_out.add_heading("Issues", level=1)
         if issues:
-            for i in issues: doc_out.add_paragraph(i, style="List Bullet")
+            for i in issues:
+                doc_out.add_paragraph(i, style="List Bullet")
         else:
             doc_out.add_paragraph("No issues detected.")
-        
+
+        doc_out.add_heading("Decisions", level=1)
+        if decisions:
+            for d in decisions:
+                doc_out.add_paragraph(d, style="List Bullet")
+        else:
+            doc_out.add_paragraph("No decisions mentioned.")
+
         doc_out.add_heading("Important Dates", level=1)
-        if important_dates:
-            for sent, d in important_dates:
+        if dates:
+            for sent, d in dates:
                 doc_out.add_paragraph(f"{d}: {sent}", style="List Bullet")
         else:
             doc_out.add_paragraph("No important dates mentioned.")
 
+        docx_path = out_dir / f"{base}.docx"
+        doc_out.save(docx_path)
 
-        doc_out.save(OUTPUT_FOLDER / f"{base}.docx")
+        processed.append(
+            {
+                "file": str(f),
+                "summary_txt": str(txt_path),
+                "summary_docx": str(docx_path),
+            }
+        )
 
-        print(f"Saved: {base}.txt / .docx")
+    return processed
 
-    print("Done.")
+# -------------------------------------------------------------------
+# 5. SIMPLE HTTP SERVER FOR PAD
+# -------------------------------------------------------------------
+class Handler(BaseHTTPRequestHandler):
+    def _send_json(self, obj, status=200):
+        data = json.dumps(obj).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_POST(self):
+        if self.path != "/process":
+            self._send_json({"error": "Not found"}, status=404)
+            return
+
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length)
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except Exception:
+            self._send_json({"error": "Invalid JSON"}, status=400)
+            return
+
+        try:
+            input_folder = payload["input_folder"]
+            output_folder = payload["output_folder"]
+            prev = int(payload.get("previous_count", 0))
+            curr = int(payload.get("current_count", 0))
+        except KeyError as e:
+            self._send_json({"error": f"Missing field {e}"}, status=400)
+            return
+
+        try:
+            processed = process_meetings(input_folder, output_folder, prev, curr)
+            self._send_json({"status": "ok", "processed": processed})
+        except Exception as e:
+            self._send_json({"status": "error", "message": str(e)}, status=500)
+
+
+def run_server(port=8000):
+    server = HTTPServer(("127.0.0.1", port), Handler)
+    print(f"Server listening on http://127.0.0.1:{port}/process")
+    server.serve_forever()
+
 
 if __name__ == "__main__":
-    main()
+    run_server()

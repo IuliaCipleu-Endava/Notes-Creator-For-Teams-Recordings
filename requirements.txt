@@ -5,3 +5,4 @@ langdetect
 accelerate 
 sentencepiece
 dateparser
+llama-cpp-python
