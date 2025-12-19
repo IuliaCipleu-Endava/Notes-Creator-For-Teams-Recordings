@@ -61,6 +61,34 @@ SUGGEST_EN = load_wordlist(CONFIG_DIR / "suggestions_keywords_en.txt")
 ISSUES_RO = load_wordlist(CONFIG_DIR / "issues_keywords_ro.txt")
 ISSUES_EN = load_wordlist(CONFIG_DIR / "issues_keywords_en.txt")
 
+TODO_PHRASES = [
+    r"\bwe need to\b",
+    r"\bshould\b",
+    r"\bmust\b",
+    r"\bto do\b",
+    r"\baction item\b",
+    r"\blet's\b",
+    r"\bde facut\b",
+]
+
+ISSUE_PHRASES = [
+    r"\bproblem\b",
+    r"\berror\b",
+    r"\bblocked\b",
+    r"\bchallenge\b",
+    r"\bissue\b",
+    r"\bnu merge\b",
+]
+
+SUGGESTION_PHRASES = [
+    r"\bpropose\b",
+    r"\bsuggest\b",
+    r"\brecommend\b",
+    r"\bar fi bine\b",
+]
+
+FILLER_WORDS_REGEX = r"\b(yes|ok|mhm|uh|hm|right|yeah|alright|a bit)\b\.?"
+ADMIN_CHATTER_REGEX = r"(can you hear me|let me share|hold on|wait a second|starting recording|stopped recording).*"
 
 def detect_language(text: str) -> str:
     try:
@@ -827,7 +855,7 @@ def clean_summary(summary):
 
     # Remove conversational fillers
     summary = re.sub(
-        r"\b(yes|ok|mhm|uh|hm|right|yeah|alright|a bit)\b\.?",
+        FILLER_WORDS_REGEX,
         "",
         summary,
         flags=re.I,
@@ -835,7 +863,7 @@ def clean_summary(summary):
 
     # Remove meeting admin chatter
     summary = re.sub(
-        r"(can you hear me|let me share|hold on|wait a second|starting recording|stopped recording).*",
+        FILLER_WORDS_REGEX,
         "",
         summary,
         flags=re.I
@@ -854,46 +882,22 @@ def clean_summary(summary):
 #  IMPROVED HEURISTIC TASK + ISSUE FINDER
 # ==========================================
 
-TODO_PHRASES = [
-    r"\bwe need to\b",
-    r"\bshould\b",
-    r"\bmust\b",
-    r"\bto do\b",
-    r"\baction item\b",
-    r"\blet's\b",
-    r"\bde facut\b",
-]
-
-ISSUE_PHRASES = [
-    r"\bproblem\b",
-    r"\berror\b",
-    r"\bblocked\b",
-    r"\bchallenge\b",
-    r"\bissue\b",
-    r"\bnu merge\b",
-]
-
-SUGGESTION_PHRASES = [
-    r"\bpropose\b",
-    r"\bsuggest\b",
-    r"\brecommend\b",
-    r"\bar fi bine\b",
-]
-
 def heuristic_extract_items(text):
     todos, issues, suggestions = [], [], []
     sentences = cached_sent_tokenize(text)
 
     for s in sentences:
         low = s.lower()
-
-        if any(re.search(p, low) for p in TODO_PHRASES):
+        todo_phrases = TODO_EN + TODO_RO
+        issue_phrases = ISSUES_EN + ISSUES_RO
+        suggestion_phrases = SUGGEST_EN + SUGGEST_RO
+        if any(re.search(p, low) for p in todo_phrases):
             todos.append(s)
 
-        if any(re.search(p, low) for p in ISSUE_PHRASES):
+        if any(re.search(p, low) for p in issue_phrases):
             issues.append(s)
 
-        if any(re.search(p, low) for p in SUGGESTION_PHRASES):
+        if any(re.search(p, low) for p in suggestion_phrases):
             suggestions.append(s)
 
     return todos, issues, suggestions
