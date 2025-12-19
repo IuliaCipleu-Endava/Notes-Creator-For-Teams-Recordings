@@ -25,11 +25,13 @@ GGUF_MODEL_PATH = r"C:\Users\icipleu\OneDrive - ENDAVA\Documents\Data Project\No
 print("Loading GGUF model (phi-2)…")
 llm = Llama(
     model_path=GGUF_MODEL_PATH,
-    n_ctx=2048,  # match training context
+    n_ctx=2048,
     n_threads=6,
     n_gpu_layers=0,
+    chat_format="chatml",
     verbose=False,
 )
+
 
 print("Model loaded.")
 
@@ -483,9 +485,12 @@ def llama_structured_notes(clean_text: str, language: str, raw_output_path: str)
 
     SYSTEM_PROMPT = (
         "You are an AI assistant that extracts structured JSON from meeting transcripts. "
-        "You MUST return ONLY valid JSON. "
+        "You MUST return ONLY valid JSON with information extracted from the transcript. "
         "For the keywords fields, return at most 3 keywords. "
-        "No explanations, no commentary, no text outside of JSON."
+        "No explanations, no commentary, no text outside of JSON. "
+        "Do not explain the structure of the JSON, just return the JSON. "
+        "Additionally, infer and fill the 'ai_suggestion' field with a concise, actionable recommendation or insight based on the transcript, "
+        "even if it is not explicitly stated by participants. If no suggestion is possible, return an empty string for 'ai_suggestion'."
     )
 
     JSON_SCHEMA = """
@@ -497,7 +502,8 @@ def llama_structured_notes(clean_text: str, language: str, raw_output_path: str)
     "solved": [],
     "issues": [],
     "suggestions": [],
-    "decisions": []
+    "decisions": [],
+    "ai_suggestion": ""
   }
 }
 """
@@ -556,6 +562,7 @@ MEETING TRANSCRIPT:
         "issues": list(dict.fromkeys([i for i in combined["issues"] if i.strip()])),
         "suggestions": list(dict.fromkeys([g for g in combined["suggestions"] if g.strip()])),
         "decisions": list(dict.fromkeys([d for d in combined["decisions"] if d.strip()])),
+        "ai_suggestion": " ".join(dict.fromkeys([s for s in combined.get("ai_suggestion", []) if s.strip()])),
     }
 
     return final
@@ -627,6 +634,7 @@ def process_meetings(input_folder: str, output_folder: str,
         deadlines = extract_deadlines(clean)
         stats = speaker_stats(clean)
         top_speaker = stats.most_common(1)[0][0] if stats else "N/A"
+        ai_suggestion = struct.get("ai_suggestion", "").strip()
 
         # Build text output
         txt_lines = []
@@ -680,8 +688,11 @@ def process_meetings(input_folder: str, output_folder: str,
             txt_lines.append("- None detected")
         txt_lines.append("")
         txt_lines.append(f"Most active speaker: {top_speaker}")
-
-
+        if ai_suggestion:
+            txt_lines.append("")
+            txt_lines.append("AI Suggestion:")
+            txt_lines.append(ai_suggestion)
+        
         txt_content = "\n".join(txt_lines)
         base = f"Summary-{f.stem}"
 
@@ -756,6 +767,10 @@ def process_meetings(input_folder: str, output_folder: str,
 
         doc_out.add_heading("Most active speaker", level=1)
         doc_out.add_paragraph(top_speaker)
+        
+        if ai_suggestion:
+            doc_out.add_heading("AI Suggestion", level=1)
+            doc_out.add_paragraph(ai_suggestion)
 
         docx_path = out_dir / f"{base}.docx"
         doc_out.save(docx_path)
