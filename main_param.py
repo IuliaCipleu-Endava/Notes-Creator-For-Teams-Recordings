@@ -273,15 +273,62 @@ def read_docx(path: Path) -> str:
     raw = re.sub(r"\n{2,}", "\n", raw)
     return raw.strip()
 
-
 def extract_participants(text: str):
+    """
+    Extract participant names from cleaned DOCX or VTT transcripts.
+    DOCX format example:
+        Name   0:06
+    VTT format example:
+        Name: text
+    """
     participants = set()
-    for line in text.splitlines():
-        m = re.match(r"^([A-ZȘȚĂÂÎ][\wăâîșț]+(?: [A-ZȘȚĂÂÎ][\wăâîșț]+)*)\s*:", line)
-        if m:
-            participants.add(m.group(1))
-            continue
+    lines = text.splitlines()
+
+    # ------------------------------------------------------
+    # MODE DETECTION
+    # ------------------------------------------------------
+    # DOCX transcripts almost always contain timestamps like "0:06", "12:44"
+    has_docx_timestamps = any(re.search(r"\b\d{1,2}:\d{2}\b", ln) for ln in lines)
+
+    # VTT transcripts contain "Name:" patterns
+    has_vtt_colon = any(re.match(r"^[A-ZȘȚĂÂÎ][\wăâîșț]+.*:", ln) for ln in lines)
+
+    # ------------------------------------------------------
+    # REGEXES
+    # ------------------------------------------------------
+
+    # DOCX speaker format:
+    #   First Last   0:45
+    pattern_docx = re.compile(
+        r"^([A-ZȘȚĂÂÎ][a-zA-ZăâîșțȘȚĂÂÎ]+(?: [A-ZȘȚĂÂÎ][a-zA-ZăâîșțȘȚĂÂÎ]+){0,2})\s+\d{1,2}:\d{2}\b"
+    )
+
+    # VTT speaker format:
+    #   First Last: text
+    pattern_vtt = re.compile(
+        r"^([A-ZȘȚĂÂÎ][\wăâîșț]+(?: [A-ZȘȚĂÂÎ][\wăâîșț]+){0,2})\s*:",
+    )
+
+    # ------------------------------------------------------
+    # EXTRACTION LOGIC
+    # ------------------------------------------------------
+    if has_docx_timestamps:
+        # Extract DOCX-style speakers
+        for ln in lines:
+            m = pattern_docx.match(ln)
+            if m:
+                participants.add(m.group(1).strip())
+
+    if has_vtt_colon or not participants:
+        # Extract VTT-style speakers
+        for ln in lines:
+            m = pattern_vtt.match(ln)
+            if m:
+                participants.add(m.group(1).strip())
+
+    # Cleanup: remove duplicates, sort
     return sorted(participants)
+
 
 def normalize_json_structure(parsed):
     """
