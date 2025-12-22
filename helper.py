@@ -458,134 +458,6 @@ def filter_items(items):
         cleaned.append(item.strip())
     return cleaned
 
-
-def llama_structured_notes(clean_text: str, language: str, raw_output_path: str) -> dict:
-    """
-    Extract structured meeting notes using llama.cpp in ChatML mode.
-    Ensures valid JSON output and merges across multiple chunks.
-    """
-
-    MAX_CHUNK_TOKENS = 1400
-    chunks = chunk_text_llm_safe(clean_text, max_tokens=MAX_CHUNK_TOKENS)
-
-    combined = {k: [] for k in
-                ["summary", "keywords", "todo", "solved", "issues", "suggestions", "decisions"]}
-
-    # --- Utility functions --------------------------------------------------
-
-    def strip_fences(text: str) -> str:
-        """Remove ```json or ``` wrappers."""
-        text = text.strip()
-        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
-        text = re.sub(r"```$", "", text)
-        return text.strip()
-
-    def safe_json_extract(text: str):
-        """Return first valid JSON found, or None."""
-        text = strip_fences(text)
-        return extract_first_json(text)
-
-    # --- Chat prompts -------------------------------------------------------
-
-    SYSTEM_PROMPT = (
-        "You are an AI assistant that extracts structured JSON from meeting transcripts. "
-        "You MUST return ONLY valid JSON with information extracted from the transcript. "
-        "For the keywords fields, return at most 3 keywords. "
-        "No explanations, no commentary, no text outside of JSON. "
-        "Do not explain the structure of the JSON, just return the JSON. "
-        "Additionally, infer and fill the 'ai_suggestion' field with a concise, actionable recommendation or insight based on the transcript, "
-        "even if it is not explicitly stated by participants. If no suggestion is possible, return an empty string for 'ai_suggestion'."
-    )
-
-    JSON_SCHEMA = """
-{
-  "meeting_notes": {
-    "summary": "",
-    "keywords": [],
-    "todo": [],
-    "solved": [],
-    "issues": [],
-    "suggestions": [],
-    "decisions": [],
-    "ai_suggestion": ""
-  }
-}
-"""
-
-    # --- Main loop ----------------------------------------------------------
-
-    for idx, chunk in enumerate(chunks):
-
-        USER_PROMPT = f"""
-LANGUAGE: {language}
-
-Extract structured meeting notes from the following transcript chunk.
-
-Return ONLY valid JSON in this exact structure:
-{JSON_SCHEMA}
-
-MEETING TRANSCRIPT:
-\"\"\"{chunk}\"\"\"
-"""
-
-        # Call llama in ChatML mode
-        res = llm.create_chat_completion(
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": USER_PROMPT}
-            ],
-            max_tokens=400,
-            temperature=0.0,
-        )
-
-        raw = res["choices"][0]["message"]["content"]
-        raw_clean = strip_fences(raw)
-
-        print(f"\n=== RAW OUTPUT CHUNK {idx+1} ===")
-        print(raw)
-
-        if raw_output_path:
-            with open(raw_output_path, "a", encoding="utf-8") as f:
-                f.write(f"\n=== CHUNK {idx+1} ===\n{raw}\n")
-
-        # Attempt JSON extraction
-        parsed = safe_json_extract(raw_clean)
-        if parsed:
-            extract_structured_from_any_json(parsed, combined)
-            print(f"Chunk {idx+1}: JSON extracted.")
-        else:
-            print(f"Chunk {idx+1}: No JSON extracted.")
-
-        # Search for AI suggestion outside JSON
-        ai_sugg_match = re.search(r'AI[_\s]?Suggestion\s*:\s*["“]?(.+?)["”]?\s*$', raw, re.I | re.M)
-        if ai_sugg_match:
-            ai_sugg = ai_sugg_match.group(1).strip()
-            if ai_sugg:
-                combined.setdefault("ai_suggestion", []).append(ai_sugg)
-
-    # --- Final merge and cleanup -------------------------------------------
-
-    # Merge all ai_suggestion sources (from JSON and regex extraction)
-    ai_sugg = combined.get("ai_suggestion", [])
-    if isinstance(ai_sugg, str):
-        ai_sugg = [ai_sugg]
-    # Remove empty and duplicate suggestions
-    ai_sugg = [s.strip() for s in ai_sugg if s.strip()]
-    ai_sugg = list(dict.fromkeys(ai_sugg))
-
-    final = {
-        "summary": " ".join(dict.fromkeys([s for s in combined["summary"] if s.strip()])),
-        "keywords": list(dict.fromkeys([k for k in combined["keywords"] if k.strip()])),
-        "todo": list(dict.fromkeys([t for t in combined["todo"] if t.strip()])),
-        "solved": list(dict.fromkeys([s for s in combined["solved"] if s.strip()])),
-        "issues": list(dict.fromkeys([i for i in combined["issues"] if i.strip()])),
-        "suggestions": list(dict.fromkeys([g for g in combined["suggestions"] if g.strip()])),
-        "decisions": list(dict.fromkeys([d for d in combined["decisions"] if d.strip()])),
-        "ai_suggestion": " ".join(ai_sugg),
-    }
-
-    return final
-
 def process_meetings(input_folder: str, output_folder: str,
                      previous_count: int, current_count: int):
 
@@ -1033,6 +905,108 @@ def _truncate_after_json(text):
                 return text[:i+1]
     return text
 
+def strip_speaker_chatter(text: str) -> str:
+    lines = []
+    for ln in text.splitlines():
+        ln = ln.strip()
+
+        # remove "Name:" prefixes
+        ln = re.sub(r"^[A-Z][a-z]+(?: [A-Z][a-z]+)*:\s*", "", ln)
+
+        # drop pure chatter
+        if ln.lower() in {
+            "ok", "okay", "yeah", "yes", "no",
+            "can you see the screen",
+            "can you hear me",
+            "well", "so", "uh", "um"
+        }:
+            continue
+
+        # drop very short noise
+        if len(ln.split()) < 4:
+            continue
+
+        lines.append(ln)
+
+    return "\n".join(lines)
+
+def extract_all_json_objects(text: str):
+    """
+    Extract ALL JSON objects from text, even if surrounded by garbage.
+    Returns a list of parsed dicts.
+    """
+    results = []
+    stack = []
+    start = None
+
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if not stack:
+                start = i
+            stack.append("{")
+        elif ch == "}":
+            if stack:
+                stack.pop()
+                if not stack and start is not None:
+                    candidate = text[start:i+1]
+                    try:
+                        results.append(json.loads(candidate))
+                    except Exception:
+                        pass
+                    start = None
+
+    return results
+
+def merge_structured_content(json_objs, combined):
+    """
+    Merge any recognizable meeting fields from ANY JSON shape.
+    """
+    FIELDS = {
+        "summary": str,
+        "bullets": list,
+        "keywords": list,
+        "todo": list,
+        "issues": list,
+        "suggestions": list,
+        "decisions": list,
+        "solved": list,
+    }
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k in FIELDS:
+                    if isinstance(v, FIELDS[k]):
+                        if k == "summary":
+                            combined["summary"].append(v)
+                        else:
+                            combined.setdefault(k, []).extend(
+                                x for x in v if isinstance(x, str)
+                            )
+                walk(v)
+        elif isinstance(obj, list):
+            for it in obj:
+                walk(it)
+
+    for o in json_objs:
+        walk(o)
+
+def salvage_from_text(raw, combined):
+    for line in raw.splitlines():
+        line = line.strip()
+        low = line.lower()
+
+        if len(line.split()) > 12 and not any(x in low for x in [
+            "can you", "did you", "are you",
+            "screen", "call", "access",
+            "calendar", "hello"
+        ]):
+            combined["summary"].append(line)
+
+        if line.startswith(("-", "*")):
+            combined["bullets"].append(line.lstrip("-* ").strip())
+
+
 def llama_structured_notes_resilient(clean_text: str, language: str, raw_output_path: str) -> dict:
     """
     Robust structured-note extraction for noisy meeting transcripts.
@@ -1047,6 +1021,8 @@ def llama_structured_notes_resilient(clean_text: str, language: str, raw_output_
     """
 
     MAX_CHUNK_TOKENS = 1400
+    clean_text = strip_speaker_chatter(clean_text)
+
     chunks = chunk_text_llm_safe(clean_text, max_tokens=MAX_CHUNK_TOKENS)
 
     # -----------------------------
@@ -1146,6 +1122,17 @@ def llama_structured_notes_resilient(clean_text: str, language: str, raw_output_
     all_decisions = []
     all_solved = []
     all_keywords = []
+    
+    combined = {
+        "summary": [],
+        "bullets": [],
+        "keywords": [],
+        "todo": [],
+        "solved": [],
+        "issues": [],
+        "suggestions": [],
+        "decisions": [],
+    }
 
     # Always seed from heuristics to avoid empties
     for chunk in chunks:
@@ -1203,19 +1190,25 @@ def llama_structured_notes_resilient(clean_text: str, language: str, raw_output_
 
         raw = _call_llm(SYSTEM_PROMPT_CHUNK, USER_PROMPT_CHUNK, max_tokens=550)
         _append_raw(f"CHUNK {idx} RAW", raw)
+        
+        json_objs = extract_all_json_objects(raw)
 
-        parsed = _extract_json(raw)
-        if not isinstance(parsed, dict):
+        if json_objs:
+            merge_structured_content(json_objs, combined)
+        else:
+            salvage_from_text(raw, combined)
+
+        if not isinstance(combined, dict):
             continue
 
         # Merge parsed content
-        bullets = parsed.get("bullets", [])
-        todo = parsed.get("todo", [])
-        issues = parsed.get("issues", [])
-        suggestions = parsed.get("suggestions", [])
-        decisions = parsed.get("decisions", [])
-        solved = parsed.get("solved", [])
-        keywords = parsed.get("keywords", [])
+        bullets = combined.get("bullets", [])
+        todo = combined.get("todo", [])
+        issues = combined.get("issues", [])
+        suggestions = combined.get("suggestions", [])
+        decisions = combined.get("decisions", [])
+        solved = combined.get("solved", [])
+        keywords = combined.get("keywords", [])
 
         if isinstance(bullets, list):
             for b in bullets:
@@ -1248,6 +1241,11 @@ def llama_structured_notes_resilient(clean_text: str, language: str, raw_output_
     if not all_bullets:
         sents = cached_sent_tokenize(clean_text)
         all_bullets = [s.strip() for s in sents[:5] if s and len(s.strip()) > 10]
+        
+    def strip_names(text: str) -> str:
+        return re.sub(r"\b[A-Z][a-z]+(?: [A-Z][a-z]+){0,2}\b:", "", text).strip()
+
+    all_bullets = [strip_names(b) for b in all_bullets]
 
     # -----------------------------
     # Phase 2: final structuring pass (ONE call)
@@ -1269,6 +1267,23 @@ def llama_structured_notes_resilient(clean_text: str, language: str, raw_output_
         '  "decisions": []\n'
         "}\n"
     )
+    def filter_bullets(bullets):
+        cleaned = []
+        for b in bullets:
+            low = b.lower()
+
+            if any(x in low for x in [
+                "can you", "did you", "are you",
+                "screen", "call", "access",
+                "calendar", "meeting", "hello"
+            ]):
+                continue
+
+            cleaned.append(b)
+
+        return cleaned
+
+    all_bullets = filter_bullets(all_bullets)
 
     # Keep prompts short; phi2/dolphin collapses with long instructions.
     bullets_block = "\n".join(f"- {b}" for b in all_bullets[:60])
@@ -1277,7 +1292,16 @@ def llama_structured_notes_resilient(clean_text: str, language: str, raw_output_
         f"LANGUAGE: {language}\n\n"
         "You are given extracted meeting bullets and candidate items.\n"
         "Rules:\n"
-        "- Summary: 5-8 sentences, remove chatter, no speaker prefixes.\n"
+        "- Summary: write a concise technical meeting summary: 4-6 sentences maximum.\n"
+        "   - Do NOT mention people, names, or questions.\n"
+        "   - Do NOT describe conversation flow.\n"
+        "   - Describe ONLY:\n"
+        "   - Databricks setup\n"
+        "   - Pipelines\n"
+        "   - Config files\n"
+        "   - Data flow (bronze/silver/gold)\n"
+        "   - Tooling (Azure DevOps, Terraform)\n"
+        "   - If something is unclear, omit it. \n"
         "- keywords: 3-6 items.\n"
         "- todo/issues/suggestions/decisions/solved: keep only explicit items.\n"
         "- If a list has no items, return an empty list (do NOT write 'None').\n\n"
@@ -1300,7 +1324,9 @@ def llama_structured_notes_resilient(clean_text: str, language: str, raw_output_
     raw_final = _call_llm(SYSTEM_PROMPT_FINAL, USER_PROMPT_FINAL, max_tokens=650)
     _append_raw("FINAL_STRUCTURING_RAW", raw_final)
 
-    parsed_final = _extract_json(raw_final)
+    json_objs = extract_all_json_objects(raw_final)
+    parsed_final = json_objs[0] if json_objs else {}
+
     if not isinstance(parsed_final, dict):
         parsed_final = {}
 
