@@ -31,8 +31,18 @@ llm = Llama(
     chat_format="chatml",
     verbose=False,
 )
+print("Model loaded.")
 
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
+model_name = "Qwen/Qwen2.5-7B-Instruct"
+
+tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained(
+    model_name, 
+    trust_remote_code=True,
+    device_map="auto",   # GPU if available
+)
 print("Model loaded.")
 
 # -------------------------------------------------------------------
@@ -1054,6 +1064,17 @@ def llama_structured_notes_resilient(clean_text: str, language: str, raw_output_
             return str(res)
         except Exception as e:
             return f"LLM ERROR: {e}"
+        
+    def _call_qwen(system_prompt: str, user_prompt: str, max_tokens: int = 500) -> str:
+        prompt = system_prompt + "\n" + user_prompt
+        inputs = tokenizer(prompt, return_tensors="pt")
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=600,
+            do_sample=False
+        )
+        raw = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        return raw
 
     def _strip_fences(text: str) -> str:
         text = (text or "").strip()
@@ -1188,7 +1209,8 @@ def llama_structured_notes_resilient(clean_text: str, language: str, raw_output_
             f'"""{chunk}"""\n'
         )
 
-        raw = _call_llm(SYSTEM_PROMPT_CHUNK, USER_PROMPT_CHUNK, max_tokens=550)
+        # raw = _call_llm(SYSTEM_PROMPT_CHUNK, USER_PROMPT_CHUNK, max_tokens=550)
+        raw = _call_qwen(SYSTEM_PROMPT_CHUNK, USER_PROMPT_CHUNK, max_tokens=550)
         _append_raw(f"CHUNK {idx} RAW", raw)
         
         json_objs = extract_all_json_objects(raw)
@@ -1321,7 +1343,8 @@ def llama_structured_notes_resilient(clean_text: str, language: str, raw_output_
         + "\n".join(f"- {t}" for t in all_solved[:40]) + "\n"
     )
 
-    raw_final = _call_llm(SYSTEM_PROMPT_FINAL, USER_PROMPT_FINAL, max_tokens=650)
+    # raw_final = _call_llm(SYSTEM_PROMPT_FINAL, USER_PROMPT_FINAL, max_tokens=650)
+    raw_final = _call_qwen(SYSTEM_PROMPT_FINAL, USER_PROMPT_FINAL, max_tokens=650)
     _append_raw("FINAL_STRUCTURING_RAW", raw_final)
 
     json_objs = extract_all_json_objects(raw_final)
