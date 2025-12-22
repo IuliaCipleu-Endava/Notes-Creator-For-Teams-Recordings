@@ -9,6 +9,9 @@ import dateparser
 
 from llama_cpp import Llama  # GGUF / llama.cpp backend
 from functools import lru_cache
+print("Loading Qwen tokenizer and model…")
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
 
 @lru_cache(maxsize=10000)
 def cached_tokenize(text: str):
@@ -33,15 +36,14 @@ llm = Llama(
 )
 print("Model loaded.")
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
 model_name = "Qwen/Qwen2.5-7B-Instruct"
 
 tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 model = AutoModelForCausalLM.from_pretrained(
-    model_name, 
+    model_name,
     trust_remote_code=True,
-    device_map="auto",   # GPU if available
+    device_map="auto",
+    dtype=torch.float16,   # important
 )
 print("Model loaded.")
 
@@ -116,29 +118,41 @@ def cached_sent_tokenize(text: str):
     return tuple(nltk.sent_tokenize(text))
 
 
-def chunk_text_llm_safe(text, max_tokens=1400):
-    """
-    Split text into chunks guaranteed to fit the model's context window.
-    """
+# def chunk_text_llm_safe(text, max_tokens=1400):
+#     """
+#     Split text into chunks guaranteed to fit the model's context window.
+#     """
+#     sentences = cached_sent_tokenize(text)
+#     chunks = []
+#     current = ""
+
+#     for s in sentences:
+#         cand = (current + " " + s).strip()
+#         tok = len(cached_tokenize(cand))
+
+#         if tok > max_tokens:
+#             if current:
+#                 chunks.append(current)
+#             current = s
+#         else:
+#             current = cand
+
+#     if current:
+#         chunks.append(current)
+#     print(f"Text chunked into {len(chunks)} parts for LLM processing.")
+#     return chunks
+def chunk_text_llm_safe(text, max_sentences=25):
     sentences = cached_sent_tokenize(text)
     chunks = []
-    current = ""
 
-    for s in sentences:
-        cand = (current + " " + s).strip()
-        tok = len(cached_tokenize(cand))
+    for i in range(0, len(sentences), max_sentences):
+        chunk = " ".join(sentences[i:i + max_sentences])
+        if chunk.strip():
+            chunks.append(chunk)
 
-        if tok > max_tokens:
-            if current:
-                chunks.append(current)
-            current = s
-        else:
-            current = cand
-
-    if current:
-        chunks.append(current)
-    print(f"Text chunked into {len(chunks)} parts for LLM processing.")
+    print(f"Text chunked into {len(chunks)} parts.")
     return chunks
+
 
 def extract_keywords(text: str, language="english", n=5):
     words = nltk.word_tokenize(text.lower())
@@ -1067,14 +1081,26 @@ def llama_structured_notes_resilient(clean_text: str, language: str, raw_output_
         
     def _call_qwen(system_prompt: str, user_prompt: str, max_tokens: int = 500) -> str:
         prompt = system_prompt + "\n" + user_prompt
-        inputs = tokenizer(prompt, return_tensors="pt")
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=600,
-            do_sample=False
+
+        inputs = tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True
         )
-        raw = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        return raw
+
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_tokens,
+                do_sample=False,
+                temperature=0.0,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+
+        return tokenizer.decode(outputs[0], skip_special_tokens=True)
+
 
     def _strip_fences(text: str) -> str:
         text = (text or "").strip()
