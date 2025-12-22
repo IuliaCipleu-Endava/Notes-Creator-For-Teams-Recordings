@@ -141,7 +141,11 @@ def cached_sent_tokenize(text: str):
 #         chunks.append(current)
 #     print(f"Text chunked into {len(chunks)} parts for LLM processing.")
 #     return chunks
-def chunk_text_llm_safe(text, max_sentences=25):
+
+def chunk_text_llm_safe(text, max_sentences=25, max_tokens=None):
+    """
+    Split text into chunks, compatible with both max_sentences and (ignored) max_tokens for backward compatibility.
+    """
     sentences = cached_sent_tokenize(text)
     chunks = []
 
@@ -1095,7 +1099,6 @@ def llama_structured_notes_resilient(clean_text: str, language: str, raw_output_
                 **inputs,
                 max_new_tokens=max_tokens,
                 do_sample=False,
-                temperature=0.0,
                 eos_token_id=tokenizer.eos_token_id,
             )
 
