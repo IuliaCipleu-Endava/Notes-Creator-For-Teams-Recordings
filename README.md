@@ -36,14 +36,14 @@ pip install -r requirements.txt
 
 ### Command Line
 
-The main processing logic is in `main_param.py`. To process meetings, use the HTTP API or call the functions directly.
+The main processing logic is in `main.py`. To process meetings, use the HTTP API or call the functions directly.
 
 ### HTTP API
 
 Start the server:
 
 ```sh
-python main_param.py
+python main.py
 ```
 
 The server listens on `http://127.0.0.1:8000/process`.
