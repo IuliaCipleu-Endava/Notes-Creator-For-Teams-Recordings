@@ -618,7 +618,7 @@ def process_meetings(input_folder: str, output_folder: str,
 
         # Ask GGUF model for structured info
         raw_path = out_dir / f"Summary-{f.stem}.raw.txt"
-        struct = llama_structured_notes(clean, language, raw_output_path=raw_path)
+        struct = llama_structured_notes_resilient(clean, language, raw_output_path=raw_path)
 
         # Merge heuristic + model (model preferred, heuristics as backup)
         summary_list = struct.get("summary", [])
@@ -1038,7 +1038,7 @@ def llama_structured_notes_resilient(clean_text: str, language: str, raw_output_
     MAX_CHUNK_TOKENS = 1400
     chunks = chunk_text_llm_safe(clean_text, max_tokens=MAX_CHUNK_TOKENS)
 
-    combined = {k: [] for k in ["summary", "todo", "solved", "issues", "suggestions", "decisions"]}
+    combined = {k: [] for k in ["summary", "keywords", "todo", "solved", "issues", "suggestions", "decisions"]}
     validated_chunks = 0
 
     # system prompt: strong, minimal, forbid explanation
@@ -1046,13 +1046,14 @@ def llama_structured_notes_resilient(clean_text: str, language: str, raw_output_
         "You are an extraction engine. Use ONLY the meeting transcript provided. "
         "Return EXACTLY one JSON object and nothing else. "
         "Do NOT add explanations, notes, translations, or comments after the JSON. "
-        "If you cannot extract anything, return empty lists/strings."
+        "Return at most 3 keywords in the keywords field. "
     )
 
     JSON_SCHEMA = (
         '{\n'
         '  "meeting_notes": {\n'
         '    "summary": "",\n'
+        '    "keywords": [],\n'
         '    "todo": [],\n'
         '    "solved": [],\n'
         '    "issues": [],\n'
@@ -1113,13 +1114,13 @@ def llama_structured_notes_resilient(clean_text: str, language: str, raw_output_
             flat = normalize_json_structure(parsed_json)
 
             # quick sanity: at least one non-empty field or keywords extracted?
-            nonempties = sum(1 for k in ["summary","todo","solved","issues","suggestions","decisions"]
+            nonempties = sum(1 for k in ["summary","keywords","todo","solved","issues","suggestions","decisions"]
                               if flat.get(k))
             # verify content originates from chunk: check overlap for summary + concatenated lists
             test_text = ""
             if isinstance(flat.get("summary",""), str):
                 test_text += flat.get("summary","") + " "
-            for k in ["todo","solved","issues","suggestions","decisions"]:
+            for k in ["keywords","todo","solved","issues","suggestions","decisions"]:
                 val = flat.get(k, [])
                 if isinstance(val, list):
                     test_text += " ".join(val) + " "
@@ -1164,6 +1165,7 @@ def llama_structured_notes_resilient(clean_text: str, language: str, raw_output_
 
     final = {
         "summary": "",
+        "keywords": [],
         "todo": [],
         "solved": [],
         "issues": [],
@@ -1178,7 +1180,7 @@ def llama_structured_notes_resilient(clean_text: str, language: str, raw_output_
         final["summary"] = merge_summaries(cand_summaries)
     else:
         final["summary"] = ""
-
+    final["keywords"] = _dedupe_keep_order(combined["keywords"])
     final["todo"] = _dedupe_keep_order(combined["todo"])
     final["solved"] = _dedupe_keep_order(combined["solved"])
     final["issues"] = _dedupe_keep_order(combined["issues"])
