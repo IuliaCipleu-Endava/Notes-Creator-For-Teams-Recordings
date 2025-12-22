@@ -448,10 +448,16 @@ def extract_from_explanation(expl, key):
     return [l for l in lines if l.lower() not in ("rest",)]
 
 def filter_items(items):
-            return [item for item in items if not (isinstance(item, str) and ("meeting transcript" in item.lower() or "meeting notes" in item.lower() or 
-                                                                              "no_decisions" in item.lower() or "no_issues" in item.lower()
-                                                                              or "no_suggestions" in item.lower() or "no_todo" in item.lower()
-                                                                               or "no_tasks" in item.lower()))]
+    cleaned = []
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        low = item.lower()
+        if "meeting transcript" in low or "meeting notes" in low:
+            continue
+        cleaned.append(item.strip())
+    return cleaned
+
 
 def llama_structured_notes(clean_text: str, language: str, raw_output_path: str) -> dict:
     """
@@ -1062,6 +1068,16 @@ def llama_structured_notes_resilient(clean_text: str, language: str, raw_output_
         '  }\n'
         '}'
     )
+    # ---- HEURISTIC SEED (always) ----
+    for chunk in chunks:
+        sents = cached_sent_tokenize(chunk)
+        if sents:
+            combined["summary"].append(" ".join(sents[:2]))
+        ht, hi, hs = heuristic_extract_items(chunk)
+        combined["todo"].extend(ht)
+        combined["issues"].extend(hi)
+        combined["suggestions"].extend(hs)
+
 
     for idx, chunk in enumerate(chunks):
         # Compose user prompt: put transcript first, then a *small* schema instruction
@@ -1126,14 +1142,17 @@ def llama_structured_notes_resilient(clean_text: str, language: str, raw_output_
                     test_text += " ".join(val) + " "
 
             overlap = _overlap_ratio(test_text, chunk)
-            # Accept parsed result if it has some non-empty fields AND reasonable overlap
-            if nonempties >= 1 and overlap >= 0.05:
+            # Always accept summary if present
+            if isinstance(flat.get("summary"), str) and flat["summary"].strip():
+                combined["summary"].append(flat["summary"])
+
+            # For lists, still apply overlap guard
+            if nonempties >= 1 and overlap >= 0.01:
                 extract_structured_from_any_json(parsed_json, combined)
                 parsed_ok = True
-                validated_chunks += 1
             else:
-                # it's likely instruction-echo or not derived from chunk -> discard parsed_json
                 parsed_ok = False
+
 
         # If parsed_json was not ok, fallback to heuristics from the chunk
         if not parsed_ok:
@@ -1199,4 +1218,18 @@ def llama_structured_notes_resilient(clean_text: str, language: str, raw_output_
             f.write(json.dumps(final, ensure_ascii=False, indent=2) + "\n")
             f.write(f"Validated chunks: {validated_chunks}/{len(chunks)}\n")
 
+    def ensure_non_empty(final, clean_text):
+        sents = cached_sent_tokenize(clean_text)
+
+        if not final["summary"] and sents:
+            final["summary"] = " ".join(sents[:3])
+
+        for key in ["todo", "issues", "suggestions", "decisions"]:
+            if not final[key]:
+                final[key] = []
+
+        return final
+
+    final = ensure_non_empty(final, clean_text)
     return final
+
