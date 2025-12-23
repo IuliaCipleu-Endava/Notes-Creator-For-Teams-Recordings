@@ -9,9 +9,6 @@ import dateparser
 
 from llama_cpp import Llama  # GGUF / llama.cpp backend
 from functools import lru_cache
-print("Loading Qwen tokenizer and model…")
-from transformers import AutoModelForCausalLM, AutoTokenizer
-import torch
 
 @lru_cache(maxsize=10000)
 def cached_tokenize(text: str):
@@ -34,17 +31,8 @@ llm = Llama(
     chat_format="chatml",
     verbose=False,
 )
-print("Model loaded.")
 
-model_name = "Qwen/Qwen2.5-3B-Instruct"
 
-tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-model = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    trust_remote_code=True,
-    device_map="auto",
-    dtype=torch.float16,   # important
-)
 print("Model loaded.")
 
 # -------------------------------------------------------------------
@@ -118,45 +106,29 @@ def cached_sent_tokenize(text: str):
     return tuple(nltk.sent_tokenize(text))
 
 
-# def chunk_text_llm_safe(text, max_tokens=1400):
-#     """
-#     Split text into chunks guaranteed to fit the model's context window.
-#     """
-#     sentences = cached_sent_tokenize(text)
-#     chunks = []
-#     current = ""
-
-#     for s in sentences:
-#         cand = (current + " " + s).strip()
-#         tok = len(cached_tokenize(cand))
-
-#         if tok > max_tokens:
-#             if current:
-#                 chunks.append(current)
-#             current = s
-#         else:
-#             current = cand
-
-#     if current:
-#         chunks.append(current)
-#     print(f"Text chunked into {len(chunks)} parts for LLM processing.")
-#     return chunks
-
-def chunk_text_llm_safe(text, max_sentences=25, max_tokens=None):
+def chunk_text_llm_safe(text, max_tokens=1400):
     """
-    Split text into chunks, compatible with both max_sentences and (ignored) max_tokens for backward compatibility.
+    Split text into chunks guaranteed to fit the model's context window.
     """
     sentences = cached_sent_tokenize(text)
     chunks = []
+    current = ""
 
-    for i in range(0, len(sentences), max_sentences):
-        chunk = " ".join(sentences[i:i + max_sentences])
-        if chunk.strip():
-            chunks.append(chunk)
+    for s in sentences:
+        cand = (current + " " + s).strip()
+        tok = len(cached_tokenize(cand))
 
-    print(f"Text chunked into {len(chunks)} parts.")
+        if tok > max_tokens:
+            if current:
+                chunks.append(current)
+            current = s
+        else:
+            current = cand
+
+    if current:
+        chunks.append(current)
+    print(f"Text chunked into {len(chunks)} parts for LLM processing.")
     return chunks
-
 
 def extract_keywords(text: str, language="english", n=5):
     words = nltk.word_tokenize(text.lower())
@@ -1082,28 +1054,6 @@ def llama_structured_notes_resilient(clean_text: str, language: str, raw_output_
             return str(res)
         except Exception as e:
             return f"LLM ERROR: {e}"
-        
-    def _call_qwen(system_prompt: str, user_prompt: str, max_tokens: int = 500) -> str:
-        prompt = system_prompt + "\n" + user_prompt
-
-        inputs = tokenizer(
-            prompt,
-            return_tensors="pt",
-            truncation=True
-        )
-
-        inputs = {k: v.to(model.device) for k, v in inputs.items()}
-
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=max_tokens,
-                do_sample=False,
-                eos_token_id=tokenizer.eos_token_id,
-            )
-
-        return tokenizer.decode(outputs[0], skip_special_tokens=True)
-
 
     def _strip_fences(text: str) -> str:
         text = (text or "").strip()
@@ -1238,8 +1188,7 @@ def llama_structured_notes_resilient(clean_text: str, language: str, raw_output_
             f'"""{chunk}"""\n'
         )
 
-        # raw = _call_llm(SYSTEM_PROMPT_CHUNK, USER_PROMPT_CHUNK, max_tokens=550)
-        raw = _call_qwen(SYSTEM_PROMPT_CHUNK, USER_PROMPT_CHUNK, max_tokens=550)
+        raw = _call_llm(SYSTEM_PROMPT_CHUNK, USER_PROMPT_CHUNK, max_tokens=550)
         _append_raw(f"CHUNK {idx} RAW", raw)
         
         json_objs = extract_all_json_objects(raw)
@@ -1372,8 +1321,7 @@ def llama_structured_notes_resilient(clean_text: str, language: str, raw_output_
         + "\n".join(f"- {t}" for t in all_solved[:40]) + "\n"
     )
 
-    # raw_final = _call_llm(SYSTEM_PROMPT_FINAL, USER_PROMPT_FINAL, max_tokens=650)
-    raw_final = _call_qwen(SYSTEM_PROMPT_FINAL, USER_PROMPT_FINAL, max_tokens=650)
+    raw_final = _call_llm(SYSTEM_PROMPT_FINAL, USER_PROMPT_FINAL, max_tokens=650)
     _append_raw("FINAL_STRUCTURING_RAW", raw_final)
 
     json_objs = extract_all_json_objects(raw_final)
