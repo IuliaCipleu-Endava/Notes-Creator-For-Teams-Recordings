@@ -6,4 +6,3 @@ accelerate
 sentencepiece
 dateparser
 llama-cpp-python
-torch
