@@ -1,0 +1,4 @@
+by (monday|tuesday|wednesday|thursday|friday|tomorrow|end of month)
+before \d{1,2}/\d{1,2}
+due
+until

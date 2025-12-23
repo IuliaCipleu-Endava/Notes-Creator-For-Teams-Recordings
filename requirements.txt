@@ -6,3 +6,4 @@ accelerate
 sentencepiece
 dateparser
 llama-cpp-python
+python-dotenv

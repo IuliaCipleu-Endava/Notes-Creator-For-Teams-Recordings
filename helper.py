@@ -1,26 +1,43 @@
+"""helper.py
+This module provides a comprehensive set of utilities for processing, analyzing, and summarizing meeting transcripts (from Microsoft Teams .vtt or .docx files) using both heuristic methods and LLM (phi-2/dolphin GGUF via llama.cpp). It includes functions for model loading, text chunking, language detection, keyword extraction, participant extraction, structured note extraction, and output formatting.
+Configuration:
+--------------
+- Uses external stopword and keyword lists from the 'config' directory for both English and Romanian.
+- Requires a GGUF LLM model file path for structured extraction.
+Dependencies:
+-------------
+- json, nltk, docx, re, pathlib, collections, langdetect, dateparser, llama_cpp, functools, math
+Intended Usage:
+---------------
+This module is intended for automated meeting note generation, especially for technical meetings involving data engineering topics (e.g., Databricks, Azure DevOps, Terraform). It is robust to noisy, real-world transcripts and can be adapted for other languages or meeting formats by updating configuration files and keyword lists.
+"""
 import json
-import nltk
-import docx
 import re
+import math
+from collections import Counter
+from dotenv import load_dotenv
+import os
 from pathlib import Path
 from collections import Counter
-from langdetect import detect
-import dateparser
-
-from llama_cpp import Llama  # GGUF / llama.cpp backend
 from functools import lru_cache
+
+import docx
+import nltk
+import dateparser
+from langdetect import detect
+from llama_cpp import Llama  # GGUF / llama.cpp backend
+
 
 @lru_cache(maxsize=10000)
 def cached_tokenize(text: str):
     """Tokenize text with LLM tokenizer using caching."""
     return tuple(llm.tokenize(text.encode("utf-8")))
 
-
-# -------------------------------------------------------------------
-# 1. MODEL LOADING (GGUF / llama.cpp)
-# -------------------------------------------------------------------
 # Change this to your actual GGUF path
-GGUF_MODEL_PATH = r"C:\Users\icipleu\OneDrive - ENDAVA\Documents\Data Project\Notes_Creator_For_Teams_Recordings\dolphin-2_6-phi-2_oasst2_chatml_v2.q4_k_m.gguf"
+load_dotenv()
+GGUF_MODEL_PATH = os.getenv("GGUF_MODEL_PATH")
+if not GGUF_MODEL_PATH:
+    raise RuntimeError("GGUF_MODEL_PATH not set in .env file")
 
 print("Loading GGUF model (phi-2)…")
 llm = Llama(
@@ -32,16 +49,26 @@ llm = Llama(
     verbose=False,
 )
 
-
 print("Model loaded.")
-
-# -------------------------------------------------------------------
-# 2. CONFIG / WORDLISTS
-# -------------------------------------------------------------------
 CONFIG_DIR = Path("config")
 
-
 def load_wordlist(path: Path):
+    """
+    Loads a list of words from a file, with each non-empty line treated as a separate word.
+    Args:
+        path (Path): The path to the file containing the word list.
+    Returns:
+        list: A list of non-empty, stripped lines from the file. Returns an empty list if the file does not exist.
+    """
+    if not path.exists():
+        return []
+    with open(path, encoding="utf-8") as f:
+        return [ln.strip() for ln in f if ln.strip()]
+    
+def load_lines(path: Path):
+    """
+    Loads a list of lines from a file, with each non-empty line treated as a separate entry.
+    """
     if not path.exists():
         return []
     with open(path, encoding="utf-8") as f:
@@ -63,34 +90,14 @@ SUGGEST_EN = load_wordlist(CONFIG_DIR / "suggestions_keywords_en.txt")
 ISSUES_RO = load_wordlist(CONFIG_DIR / "issues_keywords_ro.txt")
 ISSUES_EN = load_wordlist(CONFIG_DIR / "issues_keywords_en.txt")
 
-TODO_PHRASES = [
-    r"\bwe need to\b",
-    r"\bshould\b",
-    r"\bmust\b",
-    r"\bto do\b",
-    r"\baction item\b",
-    r"\blet's\b",
-    r"\bde facut\b",
-]
+TODO_PHRASES = [fr"\\b{p}\\b" for p in load_lines(CONFIG_DIR / "todo_phrases.txt")]
+ISSUE_PHRASES = [fr"\\b{p}\\b" for p in load_lines(CONFIG_DIR / "issue_phrases.txt")]
+SUGGESTION_PHRASES = [fr"\\b{p}\\b" for p in load_lines(CONFIG_DIR / "suggestion_phrases.txt")]
 
-ISSUE_PHRASES = [
-    r"\bproblem\b",
-    r"\berror\b",
-    r"\bblocked\b",
-    r"\bchallenge\b",
-    r"\bissue\b",
-    r"\bnu merge\b",
-]
+FILLER_WORDS_REGEX = r"\\b(" + "|".join(load_lines(CONFIG_DIR / "filler_words_regex.txt")) + r")\\b\\.?"
+ADMIN_CHATTER_REGEX = r"(" + "|".join(load_lines(CONFIG_DIR / "admin_chatter_regex.txt")) + ").*"
 
-SUGGESTION_PHRASES = [
-    r"\bpropose\b",
-    r"\bsuggest\b",
-    r"\brecommend\b",
-    r"\bar fi bine\b",
-]
-
-FILLER_WORDS_REGEX = r"\b(yes|ok|mhm|uh|hm|right|yeah|alright|a bit)\b\.?"
-ADMIN_CHATTER_REGEX = r"(can you hear me|let me share|hold on|wait a second|starting recording|stopped recording).*"
+DEADLINE_PATTERNS = [fr"{p}" for p in load_lines(CONFIG_DIR / "deadline_patterns.txt")]
 
 def detect_language(text: str) -> str:
     try:
@@ -131,6 +138,9 @@ def chunk_text_llm_safe(text, max_tokens=1400):
     return chunks
 
 def extract_keywords(text: str, language="english", n=5):
+    """
+    Extract top N keywords from text using simple frequency analysis.
+    """
     words = nltk.word_tokenize(text.lower())
     words = [w for w in words if w.isalnum()]
     stop = STOPWORDS_RO if language == "romanian" else STOPWORDS_EN
@@ -140,6 +150,9 @@ def extract_keywords(text: str, language="english", n=5):
 
 
 def clean_transcript(text: str) -> str:
+    """
+    Clean common artifacts from transcripts
+    """
     lines = text.split("\n")
     lines = [ln.strip() for ln in lines if ln.strip()]
     lines = [ln for ln in lines if "transcription" not in ln.lower()]
@@ -151,6 +164,9 @@ def clean_transcript(text: str) -> str:
 
 
 def categorize_sentences(text: str, language: str):
+    """
+    Categorize sentences into todos, solved, suggestions, issues.
+    """
     todos, solved, suggestions, issues = [], [], [], []
     sentences = cached_sent_tokenize(text)
 
@@ -295,6 +311,9 @@ def read_vtt(path: Path) -> str:
     return "\n".join(cleaned)
 
 def read_docx(path: Path) -> str:
+    """
+    Simple DOCX reader that extracts and cleans text.
+    """
     doc = docx.Document(path)
     raw = "\n".join(p.text.strip() for p in doc.paragraphs if p.text.strip())
     raw = re.sub(r"started transcription", "", raw, flags=re.I)
@@ -314,18 +333,11 @@ def extract_participants(text: str):
     participants = set()
     lines = text.splitlines()
 
-    # ------------------------------------------------------
-    # MODE DETECTION
-    # ------------------------------------------------------
     # DOCX transcripts almost always contain timestamps like "0:06", "12:44"
     has_docx_timestamps = any(re.search(r"\b\d{1,2}:\d{2}\b", ln) for ln in lines)
 
     # VTT transcripts contain "Name:" patterns
     has_vtt_colon = any(re.match(r"^[A-ZȘȚĂÂÎ][\wăâîșț]+.*:", ln) for ln in lines)
-
-    # ------------------------------------------------------
-    # REGEXES
-    # ------------------------------------------------------
 
     # DOCX speaker format:
     #   First Last   0:45
@@ -339,9 +351,6 @@ def extract_participants(text: str):
         r"^([A-ZȘȚĂÂÎ][\wăâîșț]+(?: [A-ZȘȚĂÂÎ][\wăâîșț]+){0,2})\s*:",
     )
 
-    # ------------------------------------------------------
-    # EXTRACTION LOGIC
-    # ------------------------------------------------------
     if has_docx_timestamps:
         # Extract DOCX-style speakers
         for ln in lines:
@@ -390,6 +399,9 @@ def normalize_json_structure(parsed):
     return parsed  # already flat
 
 def extract_first_json(text):
+    """
+    Extract the first complete top-level JSON object from text.
+    """
     start = text.find("{")
     if start == -1:
         return None
@@ -448,6 +460,9 @@ def extract_from_explanation(expl, key):
     return [l for l in lines if l.lower() not in ("rest",)]
 
 def filter_items(items):
+    """
+    Remove empty or irrelevant items from lists.
+    """
     cleaned = []
     for item in items:
         if not isinstance(item, str):
@@ -457,228 +472,6 @@ def filter_items(items):
             continue
         cleaned.append(item.strip())
     return cleaned
-
-def process_meetings(input_folder: str, output_folder: str,
-                     previous_count: int, current_count: int):
-
-    in_dir = Path(input_folder)
-    out_dir = Path(output_folder)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    n_files = max(current_count - previous_count, 1)
-
-    # latest N .docx + .vtt
-    files = list(in_dir.glob("*.docx")) + list(in_dir.glob("*.vtt"))
-    files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
-    files_to_process = files[:n_files]
-
-    processed = []
-
-    for f in files_to_process:
-        print(f"Processing: {f.name}")
-
-        if f.suffix.lower() == ".docx":
-            raw = read_docx(f)
-        else:
-            raw = read_vtt(f)
-
-        if not raw.strip():
-            print("Empty transcript.")
-            continue
-
-        clean = clean_transcript(raw)
-        language = detect_language(clean)
-        participants = extract_participants(clean)
-        participants = resolve_aliases(participants, clean)
-        keywords = extract_keywords(clean, language)
-        dates = extract_dates(clean, language)
-        todos_h, solved_h, sugg_h, issues_h = categorize_sentences(clean, language)
-
-        # Ask GGUF model for structured info
-        raw_path = out_dir / f"Summary-{f.stem}.raw.txt"
-        struct = llama_structured_notes_resilient(clean, language, raw_output_path=raw_path)
-
-        # Merge heuristic + model (model preferred, heuristics as backup)
-        summary_list = struct.get("summary", [])
-    
-        if isinstance(summary_list, list):
-            summary_list = filter_items(summary_list)
-            summary = merge_summaries(summary_list)
-        else:
-            summary = summary_list.strip() or " ".join(cached_sent_tokenize(clean)[:5])
-            if "meeting transcript" in summary.lower() or "meeting notes" in summary.lower():
-                summary = ""
-        summary = clean_summary(summary)
-
-        # Remove participant names from summary if any participants found
-        if participants and summary:
-            for name in participants:
-                summary = re.sub(rf"(?:^|(?<=\.|\n))\s*{re.escape(name)}:\s*", "", summary)
-
-        keywords = struct.get("keywords", []) or keywords
-        todos_h2, issues_h2, sugg_h2 = heuristic_extract_items(clean)
-        todos = filter_items(struct.get("todo", []) or todos_h or todos_h2)
-        issues = filter_items(struct.get("issues", []) or issues_h or issues_h2)
-        suggestions = filter_items(struct.get("suggestions", []) or sugg_h or sugg_h2)
-        solved = filter_items(struct.get("solved", []) or solved_h)
-        decisions = filter_items(struct.get("decisions", []))
-        deadlines = extract_deadlines(clean)
-        stats = speaker_stats(clean)
-        top_speaker = stats.most_common(1)[0][0] if stats else "N/A"
-        ai_suggestion = struct.get("ai_suggestion", "").strip()
-
-        # Build text output
-        txt_lines = []
-        txt_lines.append("--- Meeting Notes Summary ---")
-        txt_lines.append(f"Language: {language.capitalize()}")
-        txt_lines.append(
-            f"Participants: {', '.join(participants) if participants else 'N/A'}"
-        )
-        txt_lines.append("")
-        txt_lines.append("Key Points:")
-        txt_lines.extend(f"- {kw}" for kw in keywords)
-        txt_lines.append("")
-        txt_lines.append("Summary:")
-        txt_lines.append(summary)
-        txt_lines.append("")
-        txt_lines.append("To Do:")
-        txt_lines.extend(f"- {t}" for t in todos) if todos else txt_lines.append(
-            "- None identified"
-        )
-        txt_lines.append("")
-        txt_lines.append("Solved / Completed:")
-        txt_lines.extend(f"- {s}" for s in solved) if solved else txt_lines.append(
-            "- None mentioned"
-        )
-        txt_lines.append("")
-        txt_lines.append("Suggestions:")
-        txt_lines.extend(f"- {s}" for s in suggestions) if suggestions else txt_lines.append(
-            "- None identified"
-        )
-        txt_lines.append("")
-        txt_lines.append("Issues:")
-        txt_lines.extend(f"- {i}" for i in issues) if issues else txt_lines.append(
-            "- No issues flagged"
-        )
-        txt_lines.append("")
-        txt_lines.append("Decisions:")
-        txt_lines.extend(f"- {d}" for d in decisions) if decisions else txt_lines.append(
-            "- None identified"
-        )
-        txt_lines.append("")
-        txt_lines.append("Important Dates:")
-        if dates:
-            for sent, d in dates:
-                txt_lines.append(f"- {d}: {sent}")
-        else:
-            txt_lines.append("- No important dates mentioned")
-        txt_lines.append("Deadlines:")
-        if deadlines:
-            txt_lines.extend(f"- {d}" for d in deadlines)
-        else:
-            txt_lines.append("- None detected")
-        txt_lines.append("")
-        txt_lines.append(f"Most active speaker: {top_speaker}")
-        if ai_suggestion:
-            txt_lines.append("")
-            txt_lines.append("AI Suggestion:")
-            txt_lines.append(ai_suggestion)
-        
-        txt_content = "\n".join(txt_lines)
-        base = f"Summary-{f.stem}"
-
-        # Save TXT
-        txt_path = out_dir / f"{base}.txt"
-        txt_path.write_text(txt_content, encoding="utf-8")
-
-        # Save DOCX
-        doc_out = docx.Document()
-        doc_out.add_heading("Meeting Notes Summary", level=0)
-        doc_out.add_heading("Language", level=1)
-        doc_out.add_paragraph(language.capitalize())
-        doc_out.add_heading("Participants", level=1)
-        doc_out.add_paragraph(", ".join(participants) if participants else "N/A")
-
-        doc_out.add_heading("Key Points", level=1)
-        for kw in keywords:
-            doc_out.add_paragraph(kw, style="List Bullet")
-
-        doc_out.add_heading("Summary", level=1)
-        doc_out.add_paragraph(summary)
-
-        doc_out.add_heading("To Do", level=1)
-        if todos:
-            for t in todos:
-                doc_out.add_paragraph(t, style="List Bullet")
-        else:
-            doc_out.add_paragraph("No action items identified.")
-
-        doc_out.add_heading("Solved / Completed", level=1)
-        if solved:
-            for s in solved:
-                doc_out.add_paragraph(s, style="List Bullet")
-        else:
-            doc_out.add_paragraph("None mentioned.")
-
-        doc_out.add_heading("Suggestions", level=1)
-        if suggestions:
-            for s in suggestions:
-                doc_out.add_paragraph(s, style="List Bullet")
-        else:
-            doc_out.add_paragraph("No suggestions mentioned.")
-
-        doc_out.add_heading("Issues", level=1)
-        if issues:
-            for i in issues:
-                doc_out.add_paragraph(i, style="List Bullet")
-        else:
-            doc_out.add_paragraph("No issues detected.")
-
-        doc_out.add_heading("Decisions", level=1)
-        if decisions:
-            for d in decisions:
-                doc_out.add_paragraph(d, style="List Bullet")
-        else:
-            doc_out.add_paragraph("No decisions mentioned.")
-
-
-        doc_out.add_heading("Important Dates", level=1)
-        if dates:
-            for sent, d in dates:
-                doc_out.add_paragraph(f"{d}: {sent}", style="List Bullet")
-        else:
-            doc_out.add_paragraph("No important dates mentioned.")
-
-        doc_out.add_heading("Deadlines", level=1)
-        if deadlines:
-            for d in deadlines:
-                doc_out.add_paragraph(d, style="List Bullet")
-        else:
-            doc_out.add_paragraph("None detected.")
-
-        doc_out.add_heading("Most active speaker", level=1)
-        doc_out.add_paragraph(top_speaker)
-        
-        if ai_suggestion:
-            doc_out.add_heading("AI Suggestion", level=1)
-            doc_out.add_paragraph(ai_suggestion)
-
-        docx_path = out_dir / f"{base}.docx"
-        doc_out.save(docx_path)
-
-        processed.append(
-            {
-                "file": str(f),
-                "summary_txt": str(txt_path),
-                "summary_docx": str(docx_path),
-            }
-        )
-
-    return processed
-
-# ==========================================
-#  ENHANCED PARTICIPANT HANDLING
-# ==========================================
 
 def extract_participants(text: str):
     """
@@ -723,11 +516,6 @@ def extract_participants(text: str):
 
     return sorted(participants)
 
-
-# ==========================================
-#  PARTICIPANT ALIAS RESOLUTION
-# ==========================================
-
 def resolve_aliases(participants, text):
     """
     Convert short names into full names.
@@ -744,11 +532,6 @@ def resolve_aliases(participants, text):
             resolved.add(first_name_map[token])
 
     return sorted(resolved or participants)
-
-
-# ==========================================
-#  SUMMARY CLEANUP MODULE
-# ==========================================
 
 def clean_summary(summary):
     """
@@ -783,12 +566,10 @@ def clean_summary(summary):
 
     return summary.strip()
 
-
-# ==========================================
-#  IMPROVED HEURISTIC TASK + ISSUE FINDER
-# ==========================================
-
 def heuristic_extract_items(text):
+    """
+    Heuristic extraction of todos, issues, suggestions from text.
+    """
     todos, issues, suggestions = [], [], []
     sentences = cached_sent_tokenize(text)
 
@@ -808,29 +589,15 @@ def heuristic_extract_items(text):
 
     return todos, issues, suggestions
 
-
-# ==========================================
-#  DEADLINE & DATE IMPROVEMENTS
-# ==========================================
-
-DEADLINE_PATTERNS = [
-    r"\bby (monday|tuesday|wednesday|thursday|friday|tomorrow|end of month)\b",
-    r"\bbefore \d{1,2}/\d{1,2}\b",
-    r"\bdue\b",
-    r"\buntil\b",
-]
-
 def extract_deadlines(text):
+    """"
+    Extract deadline expressions from text using regex patterns.
+    """
     deadlines = []
     for pattern in DEADLINE_PATTERNS:
         for m in re.finditer(pattern, text, flags=re.I):
             deadlines.append(m.group())
     return deadlines
-
-
-# ==========================================
-#  SPEAKER STATISTICS
-# ==========================================
 
 def speaker_stats(text):
     """
@@ -843,11 +610,6 @@ def speaker_stats(text):
             speaker = ln.split(":")[0].strip()
             stats[speaker] += 1
     return stats
-
-
-# ==========================================
-#  SUMMARY MERGING IMPROVEMENT
-# ==========================================
 
 def merge_summaries(summary_list):
     """
@@ -868,24 +630,13 @@ def merge_summaries(summary_list):
 
     return " ".join(final)
 
-###########Will test Monday####################
-import math
-from collections import Counter
 
 def _word_set(text, n_min_len=3):
+    """
+    Return set of unique words in text, filtered by minimum length.
+    """
     words = re.findall(r"\w+", text.lower())
     return set(w for w in words if len(w) >= n_min_len)
-
-def _overlap_ratio(small_text, large_text):
-    """
-    proportion of words in small_text that also appear in large_text
-    (used to verify model output actually derives from chunk)
-    """
-    sset = _word_set(small_text)
-    lset = _word_set(large_text)
-    if not sset:
-        return 0.0
-    return len(sset & lset) / len(sset)
 
 def _truncate_after_json(text):
     """
@@ -992,6 +743,9 @@ def merge_structured_content(json_objs, combined):
         walk(o)
 
 def salvage_from_text(raw, combined):
+    """
+    Extract deadline expressions from text using regex patterns.
+    """
     for line in raw.splitlines():
         line = line.strip()
         low = line.lower()
@@ -1054,17 +808,6 @@ def llama_structured_notes_resilient(clean_text: str, language: str, raw_output_
             return str(res)
         except Exception as e:
             return f"LLM ERROR: {e}"
-
-    def _strip_fences(text: str) -> str:
-        text = (text or "").strip()
-        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
-        text = re.sub(r"\s*```$", "", text)
-        return text.strip()
-
-    def _extract_json(raw: str):
-        raw = _strip_fences(raw)
-        raw = _truncate_after_json(raw)
-        return extract_first_json(raw)
 
     def _is_garbage_summary(s: str) -> bool:
         if not s or not s.strip():
@@ -1356,3 +1099,230 @@ def llama_structured_notes_resilient(clean_text: str, language: str, raw_output_
     _append_raw("FINAL_EXTRACTED", json.dumps(final, ensure_ascii=False, indent=2))
 
     return final
+
+def process_meetings(input_folder: str, output_folder: str,
+                     previous_count: int, current_count: int):
+    """
+    Process latest N meeting transcripts from input_folder, generate structured summaries.
+    Args:
+        input_folder (str): Path to folder with .docx and .vtt files.
+        output_folder (str): Path to save summaries.
+        previous_count (int): Previous number of processed files.
+        current_count (int): Current number of files in input_folder.
+    Returns:
+        list: List of dicts with processed file info.
+    """
+    in_dir = Path(input_folder)
+    out_dir = Path(output_folder)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    n_files = max(current_count - previous_count, 1)
+
+    # latest N .docx + .vtt
+    files = list(in_dir.glob("*.docx")) + list(in_dir.glob("*.vtt"))
+    files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+    files_to_process = files[:n_files]
+
+    processed = []
+
+    for f in files_to_process:
+        print(f"Processing: {f.name}")
+
+        if f.suffix.lower() == ".docx":
+            raw = read_docx(f)
+        else:
+            raw = read_vtt(f)
+
+        if not raw.strip():
+            print("Empty transcript.")
+            continue
+
+        clean = clean_transcript(raw)
+        language = detect_language(clean)
+        participants = extract_participants(clean)
+        participants = resolve_aliases(participants, clean)
+        keywords = extract_keywords(clean, language)
+        dates = extract_dates(clean, language)
+        todos_h, solved_h, sugg_h, issues_h = categorize_sentences(clean, language)
+
+        # Ask GGUF model for structured info
+        raw_path = out_dir / f"Summary-{f.stem}.raw.txt"
+        struct = llama_structured_notes_resilient(clean, language, raw_output_path=raw_path)
+
+        # Merge heuristic + model (model preferred, heuristics as backup)
+        summary_list = struct.get("summary", [])
+    
+        if isinstance(summary_list, list):
+            summary_list = filter_items(summary_list)
+            summary = merge_summaries(summary_list)
+        else:
+            summary = summary_list.strip() or " ".join(cached_sent_tokenize(clean)[:5])
+            if "meeting transcript" in summary.lower() or "meeting notes" in summary.lower():
+                summary = ""
+        summary = clean_summary(summary)
+
+        # Remove participant names from summary if any participants found
+        if participants and summary:
+            for name in participants:
+                summary = re.sub(rf"(?:^|(?<=\.|\n))\s*{re.escape(name)}:\s*", "", summary)
+
+        keywords = struct.get("keywords", []) or keywords
+        todos_h2, issues_h2, sugg_h2 = heuristic_extract_items(clean)
+        todos = filter_items(struct.get("todo", []) or todos_h or todos_h2)
+        issues = filter_items(struct.get("issues", []) or issues_h or issues_h2)
+        suggestions = filter_items(struct.get("suggestions", []) or sugg_h or sugg_h2)
+        solved = filter_items(struct.get("solved", []) or solved_h)
+        decisions = filter_items(struct.get("decisions", []))
+        deadlines = extract_deadlines(clean)
+        stats = speaker_stats(clean)
+        top_speaker = stats.most_common(1)[0][0] if stats else "N/A"
+        ai_suggestion = struct.get("ai_suggestion", "").strip()
+
+        # Build text output
+        txt_lines = []
+        txt_lines.append("--- Meeting Notes Summary ---")
+        txt_lines.append(f"Language: {language.capitalize()}")
+        txt_lines.append(
+            f"Participants: {', '.join(participants) if participants else 'N/A'}"
+        )
+        txt_lines.append("")
+        txt_lines.append("Key Points:")
+        txt_lines.extend(f"- {kw}" for kw in keywords)
+        txt_lines.append("")
+        txt_lines.append("Summary:")
+        txt_lines.append(summary)
+        txt_lines.append("")
+        txt_lines.append("To Do:")
+        txt_lines.extend(f"- {t}" for t in todos) if todos else txt_lines.append(
+            "- None identified"
+        )
+        txt_lines.append("")
+        txt_lines.append("Solved / Completed:")
+        txt_lines.extend(f"- {s}" for s in solved) if solved else txt_lines.append(
+            "- None mentioned"
+        )
+        txt_lines.append("")
+        txt_lines.append("Suggestions:")
+        txt_lines.extend(f"- {s}" for s in suggestions) if suggestions else txt_lines.append(
+            "- None identified"
+        )
+        txt_lines.append("")
+        txt_lines.append("Issues:")
+        txt_lines.extend(f"- {i}" for i in issues) if issues else txt_lines.append(
+            "- No issues flagged"
+        )
+        txt_lines.append("")
+        txt_lines.append("Decisions:")
+        txt_lines.extend(f"- {d}" for d in decisions) if decisions else txt_lines.append(
+            "- None identified"
+        )
+        txt_lines.append("")
+        txt_lines.append("Important Dates:")
+        if dates:
+            for sent, d in dates:
+                txt_lines.append(f"- {d}: {sent}")
+        else:
+            txt_lines.append("- No important dates mentioned")
+        txt_lines.append("Deadlines:")
+        if deadlines:
+            txt_lines.extend(f"- {d}" for d in deadlines)
+        else:
+            txt_lines.append("- None detected")
+        txt_lines.append("")
+        txt_lines.append(f"Most active speaker: {top_speaker}")
+        if ai_suggestion:
+            txt_lines.append("")
+            txt_lines.append("AI Suggestion:")
+            txt_lines.append(ai_suggestion)
+        
+        txt_content = "\n".join(txt_lines)
+        base = f"Summary-{f.stem}"
+
+        # Save TXT
+        txt_path = out_dir / f"{base}.txt"
+        txt_path.write_text(txt_content, encoding="utf-8")
+
+        # Save DOCX
+        doc_out = docx.Document()
+        doc_out.add_heading("Meeting Notes Summary", level=0)
+        doc_out.add_heading("Language", level=1)
+        doc_out.add_paragraph(language.capitalize())
+        doc_out.add_heading("Participants", level=1)
+        doc_out.add_paragraph(", ".join(participants) if participants else "N/A")
+
+        doc_out.add_heading("Key Points", level=1)
+        for kw in keywords:
+            doc_out.add_paragraph(kw, style="List Bullet")
+
+        doc_out.add_heading("Summary", level=1)
+        doc_out.add_paragraph(summary)
+
+        doc_out.add_heading("To Do", level=1)
+        if todos:
+            for t in todos:
+                doc_out.add_paragraph(t, style="List Bullet")
+        else:
+            doc_out.add_paragraph("No action items identified.")
+
+        doc_out.add_heading("Solved / Completed", level=1)
+        if solved:
+            for s in solved:
+                doc_out.add_paragraph(s, style="List Bullet")
+        else:
+            doc_out.add_paragraph("None mentioned.")
+
+        doc_out.add_heading("Suggestions", level=1)
+        if suggestions:
+            for s in suggestions:
+                doc_out.add_paragraph(s, style="List Bullet")
+        else:
+            doc_out.add_paragraph("No suggestions mentioned.")
+
+        doc_out.add_heading("Issues", level=1)
+        if issues:
+            for i in issues:
+                doc_out.add_paragraph(i, style="List Bullet")
+        else:
+            doc_out.add_paragraph("No issues detected.")
+
+        doc_out.add_heading("Decisions", level=1)
+        if decisions:
+            for d in decisions:
+                doc_out.add_paragraph(d, style="List Bullet")
+        else:
+            doc_out.add_paragraph("No decisions mentioned.")
+
+
+        doc_out.add_heading("Important Dates", level=1)
+        if dates:
+            for sent, d in dates:
+                doc_out.add_paragraph(f"{d}: {sent}", style="List Bullet")
+        else:
+            doc_out.add_paragraph("No important dates mentioned.")
+
+        doc_out.add_heading("Deadlines", level=1)
+        if deadlines:
+            for d in deadlines:
+                doc_out.add_paragraph(d, style="List Bullet")
+        else:
+            doc_out.add_paragraph("None detected.")
+
+        doc_out.add_heading("Most active speaker", level=1)
+        doc_out.add_paragraph(top_speaker)
+        
+        if ai_suggestion:
+            doc_out.add_heading("AI Suggestion", level=1)
+            doc_out.add_paragraph(ai_suggestion)
+
+        docx_path = out_dir / f"{base}.docx"
+        doc_out.save(docx_path)
+
+        processed.append(
+            {
+                "file": str(f),
+                "summary_txt": str(txt_path),
+                "summary_docx": str(docx_path),
+            }
+        )
+
+    return processed
